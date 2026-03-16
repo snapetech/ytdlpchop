@@ -1,6 +1,6 @@
 # ytdlpchop
 
-`ytdlpchop` is a music identification and triage app for messy sources:
+`ytdlpchop` is a music identification app for messy sources:
 
 - YouTube uploads with no track list
 - long mixes and “war music” style compilations
@@ -8,7 +8,7 @@
 - local audio/video files
 - sources that may be cataloged, uncataloged, channel-original, or AI-generated
 
-This project does not pretend one recognizer can solve everything. It treats identification as an evidence-fusion problem:
+This project is built around one goal: identify tracks from ugly real-world sources as accurately as possible. It uses evidence fusion because one recognizer is not enough:
 
 - exact or near-exact audio recognition
 - distortion-tolerant local matching
@@ -17,7 +17,11 @@ This project does not pretend one recognizer can solve everything. It treats ide
 - corpus similarity
 - AI-style forensic heuristics
 
-The result is not just “what song is this?” It is also “how sure are we?”, “what evidence supports that?”, and “is this more likely a real catalog track, an original upload, or AI/channel-original material?”
+The output is meant to answer three questions:
+
+- what is this track, if it can be identified
+- what are the best candidates, if it cannot be identified cleanly
+- how strong is the evidence behind that conclusion
 
 ## What The App Actually Does
 
@@ -80,9 +84,9 @@ These are weaker than direct audio hits, but still useful.
 
 This layer is for candidate generation and corroboration, not blind trust.
 
-### 4. AI/original-content triage
+### 4. AI/original-content classification
 
-When no catalog match exists, the app does not stop. It asks what kind of failure this is.
+When no catalog match exists, the app does not stop. It tries to classify what kind of source it is dealing with.
 
 It currently scores:
 
@@ -92,7 +96,7 @@ It currently scores:
 - lack of embedded track metadata
 - presence or absence of recognizer hits
 
-This does not prove AI generation. It is a triage layer that helps separate:
+This does not prove AI generation. It is a classification layer that helps separate:
 
 - recognized catalog tracks
 - likely uncataloged/original material
@@ -111,7 +115,7 @@ The app can use:
 - OCR
 - audio recognition
 
-This is the richest source type for investigation.
+This is the richest source type for identification work.
 
 ### Spotify
 
@@ -132,7 +136,7 @@ This is the cleanest path when you already have the media locally.
 
 ## Verdicts
 
-The app emits a source-level `assessment`.
+The app emits a source-level `assessment` after combining all evidence.
 
 Current labels:
 
@@ -153,7 +157,7 @@ How to read them:
 - `likely_ai_or_channel_original`:
   no direct recognizer hits plus supporting signals that this may be synthetic or house-made
 - `needs_manual_review`:
-  mixed evidence, no strong automatic answer
+  mixed evidence, no strong automatic answer yet
 
 The app is intentionally conservative now: transcript-only MusicBrainz candidates are not allowed to masquerade as true IDs without some corroboration.
 
@@ -187,7 +191,7 @@ Spotify runs also include:
 - `matched_youtube_candidate_present`
 - `youtube_candidate_count`
 
-Use the scorecard when you want to understand why the app made a call instead of just reading the top-line label.
+Use the scorecard when you want to understand why the app identified something, refused to overclaim, or surfaced only a weak candidate.
 
 ## What Works Well
 
@@ -254,7 +258,7 @@ Current env vars of interest:
 
 ## Typical Runs
 
-Minimal YouTube investigation:
+Minimal YouTube identification:
 
 ```bash
 bin/ytdlpchop identify \
@@ -264,7 +268,7 @@ bin/ytdlpchop identify \
   'https://www.youtube.com/watch?v=...'
 ```
 
-Real YouTube triage run:
+Real YouTube identification run:
 
 ```bash
 source .env
@@ -356,7 +360,7 @@ And usually also:
 - `comments/`
 - transcript and excerpt artifacts under `reports/`
 
-The machine-readable report is the source of truth. The Markdown summary is a readable explanation of the same evidence.
+The machine-readable report is the source of truth. The Markdown summary is the readable explanation of how the app got to its answer.
 
 ## Real-World Interpretation
 
@@ -382,7 +386,7 @@ That is the right mental model for this project:
 
 ## Roadmap Direction
 
-The repo already has the shape needed for deeper MIR and forensic work:
+The repo already has the shape needed for deeper MIR and evidence-driven identification work:
 
 - stronger local corpus workflows
 - better `audfprint` indexing and querying
@@ -392,4 +396,4 @@ The repo already has the shape needed for deeper MIR and forensic work:
 
 If you care about one sentence summary:
 
-`ytdlpchop` is a free-first audio investigation toolkit that tries to identify tracks when possible, and explain the failure mode when identification is not possible.
+`ytdlpchop` is a free-first audio identification engine that tries to name the track, rank the candidates, and show its evidence instead of bluffing.
