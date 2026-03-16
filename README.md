@@ -1,128 +1,270 @@
 # ytdlpchop
 
-`ytdlpchop` is a free-only music identification and triage toolkit for difficult sources.
+`ytdlpchop` is a music identification and triage app for messy sources:
 
-It has two entrypoints:
-
-- [`bin/yt_audio_id.sh`](/home/keith/Documents/code/ytdlpchop/bin/yt_audio_id.sh) for the original Bash workflow around `yt-dlp`, `ffmpeg`, `fpcalc`, and AcoustID.
-- [`bin/ytdlpchop`](/home/keith/Documents/code/ytdlpchop/bin/ytdlpchop) for the higher-level app workflow that fuses multiple signals into one report.
-
-The app is meant for:
-
-- YouTube uploads with missing or unreliable metadata
-- Spotify track URLs used as a metadata source and preview-audio source
-- local audio or video files
+- YouTube uploads with no track list
+- long mixes and “war music” style compilations
+- Spotify track URLs, using public metadata and preview audio
+- local audio/video files
 - sources that may be cataloged, uncataloged, channel-original, or AI-generated
 
-## Requirements
+This project does not pretend one recognizer can solve everything. It treats identification as an evidence-fusion problem:
+
+- exact or near-exact audio recognition
+- distortion-tolerant local matching
+- transcript and metadata search
+- comment and OCR clues
+- corpus similarity
+- AI-style forensic heuristics
+
+The result is not just “what song is this?” It is also “how sure are we?”, “what evidence supports that?”, and “is this more likely a real catalog track, an original upload, or AI/channel-original material?”
+
+## What The App Actually Does
+
+The main CLI is [`bin/ytdlpchop`](/home/keith/Documents/code/ytdlpchop/bin/ytdlpchop).
+
+Given a source, it can:
+
+- download or normalize the media
+- chop it into overlapping windows
+- fingerprint each window
+- run multiple recognizers
+- pull transcript and metadata clues
+- score AI-like audio artifacts
+- summarize all of that into one report
+
+There is also an older Bash workflow at [`bin/yt_audio_id.sh`](/home/keith/Documents/code/ytdlpchop/bin/yt_audio_id.sh). It is still useful for raw AcoustID-oriented scanning, but the Python app is the real product now.
+
+## Identification Strategy
+
+`ytdlpchop` uses layers, not one silver bullet.
+
+### 1. Direct audio recognizers
+
+These are the strongest signals when they hit.
+
+- `SongRec`:
+  Shazam-style recognition. In practice this is often the best free recognizer here for mainstream catalog music.
+- `AcoustID` + `Chromaprint`:
+  Best for near-identical audio, duplicate-ish sources, and known fingerprints already present in the public AcoustID/MusicBrainz ecosystem.
+
+If repeated windows agree, the app treats that as strong evidence.
+
+### 2. Distortion-tolerant and local matching
+
+These help when the source is altered, noisy, or not in public databases.
+
+- `Panako`:
+  local distortion-tolerant matcher with per-run local storage
+- `audfprint`:
+  local matching against a local database
+- local corpus reranking:
+  compare against fingerprints you have saved from known tracks, known misses, or channel-local material
+
+These do not magically identify a song against the internet. They help you recognize reuse, repeats, and local families of audio.
+
+### 3. Transcript and metadata search
+
+These are weaker than direct audio hits, but still useful.
+
+- `Whisper`:
+  transcribe vocals or source excerpts
+- `MusicBrainz` search:
+  search recordings from transcript phrases
+- Spotify metadata bridge:
+  use the public Spotify page and preview audio
+- YouTube metadata:
+  titles, descriptions, chapters, comment signals
+- OCR:
+  scrape on-screen text from video frames
+
+This layer is for candidate generation and corroboration, not blind trust.
+
+### 4. AI/original-content triage
+
+When no catalog match exists, the app does not stop. It asks what kind of failure this is.
+
+It currently scores:
+
+- audio artifact heuristics from the analyzed clips
+- provenance-like keywords in metadata or text
+- comment patterns like “what is the song at 8:40?” or “playlist please”
+- lack of embedded track metadata
+- presence or absence of recognizer hits
+
+This does not prove AI generation. It is a triage layer that helps separate:
+
+- recognized catalog tracks
+- likely uncataloged/original material
+- likely AI/channel-original material
+- mixed cases that still need manual review
+
+## Source Types
+
+### YouTube
+
+The app can use:
+
+- media download
+- video metadata
+- comments
+- OCR
+- audio recognition
+
+This is the richest source type for investigation.
+
+### Spotify
+
+`yt-dlp` does not download Spotify audio. Spotify is handled differently:
+
+- parse the public track page
+- extract public metadata
+- use the public preview URL when present
+- optionally search YouTube for a corresponding public upload
+
+That means Spotify support is excellent for metadata and decent for preview-based recognition, but it is limited by what Spotify exposes publicly.
+
+### Local files
+
+If `ffmpeg` can read it, the app can analyze it.
+
+This is the cleanest path when you already have the media locally.
+
+## Verdicts
+
+The app emits a source-level `assessment`.
+
+Current labels:
+
+- `recognized_cataloged_track`
+- `candidate_match_found`
+- `likely_uncataloged_or_original`
+- `likely_ai_or_channel_original`
+- `needs_manual_review`
+
+How to read them:
+
+- `recognized_cataloged_track`:
+  strong result, usually driven by repeated direct recognizer hits
+- `candidate_match_found`:
+  weak candidate, not confirmed enough to treat as solved
+- `likely_uncataloged_or_original`:
+  probably real music, but not cleanly identified in public systems
+- `likely_ai_or_channel_original`:
+  no direct recognizer hits plus supporting signals that this may be synthetic or house-made
+- `needs_manual_review`:
+  mixed evidence, no strong automatic answer
+
+The app is intentionally conservative now: transcript-only MusicBrainz candidates are not allowed to masquerade as true IDs without some corroboration.
+
+## Scorecard
+
+Every run writes a machine-readable `scorecard` in `reports/summary.json`.
+
+Important fields include:
+
+- `source_type`
+- `analysis_audio_source`
+- `embedded_metadata_present`
+- `songrec_hit_count`
+- `songrec_distinct_match_count`
+- `acoustid_recording_hit_count`
+- `raw_acoustid_hit_count`
+- `panako_hit_count`
+- `corpus_match_count`
+- `transcript_hit_count`
+- `musicbrainz_candidate_count`
+- `playlist_request_count`
+- `ai_comment_mentions`
+- `timestamp_comment_count`
+- `mean_ai_artifact_score`
+- `max_ai_artifact_score`
+
+Spotify runs also include:
+
+- `spotify_track_id_present`
+- `spotify_preview_url_present`
+- `matched_youtube_candidate_present`
+- `youtube_candidate_count`
+
+Use the scorecard when you want to understand why the app made a call instead of just reading the top-line label.
+
+## What Works Well
+
+- mainstream catalog tracks
+- official uploads and topic-channel uploads
+- public Spotify tracks with exposed preview audio
+- repeated audio across a local corpus
+- sources where comments or OCR provide useful clues
+
+## What Fails Often
+
+- long ambient mixes with no known public registration
+- AI-generated or channel-original music with no public fingerprint coverage
+- heavily transformed uploads
+- obscure music with no MusicBrainz/AcoustID presence
+
+This is normal. It reflects the public ecosystem, not just the app.
+
+## Tooling
 
 Core required:
 
-- `bash`
 - `python3`
+- `bash`
 - `yt-dlp`
 - `ffmpeg`
 - `ffprobe`
 - `fpcalc`
 
-Optional, depending on features you enable:
+Useful optionals:
 
-- `curl` for AcoustID lookups and submissions
-- `jq` for metadata parsing and normalized AcoustID summaries
-- `gzip` for compressed AcoustID POST requests
-- `pyacoustid` for the optional Python lookup backend
-- `songrec` for Shazam-style recognition
-- `tesseract` for OCR on video frames
-- `whisper` for transcript extraction
-- `demucs` or the cloned Demucs repo plus Python environment for stem separation
-- `java` for Panako
-- Python deps for `external/audfprint`
+- `songrec`
+- `curl`
+- `jq`
+- `gzip`
+- `whisper`
+- `tesseract`
+- Java for `Panako`
 
-## Supported Sources
+Extra integrated source trees under [`external/`](/home/keith/Documents/code/ytdlpchop/external):
 
-- YouTube URLs
-- Spotify track URLs
-- local files supported by `ffmpeg`
+- [`external/Panako`](/home/keith/Documents/code/ytdlpchop/external/Panako)
+- [`external/audfprint`](/home/keith/Documents/code/ytdlpchop/external/audfprint)
+- [`external/demucs`](/home/keith/Documents/code/ytdlpchop/external/demucs)
+- [`external/essentia`](/home/keith/Documents/code/ytdlpchop/external/essentia)
 
-Spotify support is metadata-first:
+Not every vendored tool is equally wired into the app yet:
 
-- read public Spotify page metadata
-- use the public preview audio when available
-- search for the best matching YouTube source when you want a full public audio source
-- carry the Spotify track ID and matched YouTube candidate into the final report
+- `Panako` is integrated and exercised
+- `audfprint` is integrated in a basic local-run form
+- `Demucs` is used for stem separation
+- `Essentia` is vendored for future deeper MIR work and local experiments
 
-## Features
+## Secrets
 
-- Multi-profile clip scans such as `90:45,60:30,45:15`
-- Chromaprint fingerprint generation with configurable algorithm
-- AcoustID lookup, candidate export, and optional submission support
-- SongRec/Shazam-style recognition on clips
-- comment mining and timestamp harvesting from YouTube
-- OCR against sampled video frames
-- Demucs stem separation on excerpts
-- Whisper transcript extraction from source audio and vocal stems
-- MusicBrainz text search from transcript phrases
-- Panako distortion-tolerant matching with per-run local storage
-- Audfprint local matching
-- local corpus reranking with stored fingerprints
-- heuristic AI-audio artifact scoring
-- provenance signal scanning in metadata and container fields
-- source-level assessment and machine-readable scorecard
-- Spotify track URL support using public page metadata, public preview audio when available, and automatic YouTube candidate search
+Local secrets go in [`.env`](/home/keith/Documents/code/ytdlpchop/.env), which is gitignored.
 
-## App Report Model
+A safe template lives in [`.env.example`](/home/keith/Documents/code/ytdlpchop/.env.example).
 
-Each app run writes:
+Current env vars of interest:
 
-- `reports/summary.json`
-- `reports/summary.md`
+- `ACOUSTID_API_KEY`
+- `ACOUSTID_USER_KEY`
 
-Important report sections:
+## Typical Runs
 
-- `assessment`: source-level verdict such as `recognized_cataloged_track` or `likely_ai_or_channel_original`
-- `scorecard`: explicit evidence counts and booleans used for classification
-- `metadata`: normalized source metadata plus Spotify bridge fields when relevant
-- `clips`: per-window findings from AcoustID, SongRec, AI heuristics, Audfprint, Panako, corpus, and MusicBrainz
-- `panako_store`: the source-audio indexing step used by Panako when enabled
-- `transcripts`: Whisper output and transcript-derived MusicBrainz candidates
-- `ocr`: extracted on-frame text
-
-The scorecard now includes source-bridge evidence such as:
-
-- `source_type`
-- `analysis_audio_source`
-- `spotify_track_id_present`
-- `spotify_preview_url_present`
-- `matched_youtube_candidate_present`
-- `youtube_candidate_count`
-- recognizer hit counts
-- transcript and OCR counts
-- provenance and AI heuristic counts
-
-## Usage
-
-Original Bash workflow:
+Minimal YouTube investigation:
 
 ```bash
-bin/yt_audio_id.sh 'https://www.youtube.com/watch?v=rEYpDlFzgkk'
-```
-
-Higher-level app run on a YouTube source:
-
-```bash
-source .env
 bin/ytdlpchop identify \
-  --comments \
-  --max-comments 40 \
   --songrec \
   --acoustid \
-  --ai-heuristics \
-  --whisper \
-  --musicbrainz \
-  'https://www.youtube.com/watch?v=rEYpDlFzgkk'
+  -o out/basic \
+  'https://www.youtube.com/watch?v=...'
 ```
 
-Dense run with more free tools enabled:
+Real YouTube triage run:
 
 ```bash
 source .env
@@ -130,6 +272,23 @@ bin/ytdlpchop identify \
   --comments \
   --max-comments 40 \
   --focus-comments \
+  --songrec \
+  --acoustid \
+  --ai-heuristics \
+  --whisper \
+  --musicbrainz \
+  --panako \
+  --audfprint \
+  -o out/investigation \
+  'https://www.youtube.com/watch?v=...'
+```
+
+Heavier run with stem separation:
+
+```bash
+source .env
+bin/ytdlpchop identify \
+  --comments \
   --songrec \
   --acoustid \
   --ai-heuristics \
@@ -141,21 +300,10 @@ bin/ytdlpchop identify \
   --audfprint \
   --full-source-fingerprint \
   -o out/full-free \
-  'https://www.youtube.com/watch?v=rEYpDlFzgkk'
+  'https://www.youtube.com/watch?v=...'
 ```
 
-Local file smoke test with SongRec plus Panako:
-
-```bash
-bin/ytdlpchop identify \
-  --songrec \
-  --panako \
-  --max-clips-per-profile 1 \
-  -o out/panako-smoke \
-  '/path/to/file.webm'
-```
-
-Spotify metadata bridge:
+Spotify bridge run:
 
 ```bash
 source .env
@@ -165,73 +313,83 @@ bin/ytdlpchop identify \
   --ai-heuristics \
   --whisper \
   --musicbrainz \
+  --panako \
   --spotify-youtube-search 5 \
   -o out/spotify \
   'https://open.spotify.com/track/1UEIQUuPESrpdCDHhKLL96'
 ```
 
-AcoustID-focused Bash workflow examples:
+Local file run:
+
+```bash
+bin/ytdlpchop identify \
+  --songrec \
+  --panako \
+  --max-clips-per-profile 1 \
+  -o out/local \
+  '/path/to/file.webm'
+```
+
+Original AcoustID-heavy Bash workflow:
 
 ```bash
 source .env
 bin/yt_audio_id.sh \
   --profiles 30:60,30:20,20:10 \
   -o out/dense \
-  'https://www.youtube.com/watch?v=rEYpDlFzgkk'
-```
-
-```bash
-source .env
-bin/yt_audio_id.sh \
-  --lookup-backend pyacoustid \
-  -o out/py \
-  'https://www.youtube.com/watch?v=rEYpDlFzgkk'
-```
-
-```bash
-source .env
-export ACOUSTID_USER_KEY='your_user_key'
-bin/yt_audio_id.sh \
-  --submit-source \
-  --submit-track 'Track Title' \
-  --submit-artist 'Artist Name' \
-  --submit-album 'Album Title' \
-  --submit-year 2026 \
   'https://www.youtube.com/watch?v=...'
 ```
 
-## Output
+## Output Layout
 
-Each run creates an output directory containing:
+App runs write:
 
-- `download/` original downloaded audio file
-- `clips/` generated FLAC clips grouped by profile
-- `fingerprints/` raw `fpcalc` output per clip grouped by profile
-- `acoustid/` raw AcoustID responses per clip grouped by profile
-- `clip-index.tsv` clip timing index across profiles
-- `fingerprints.tsv` fingerprint index across profiles
-- `acoustid-summary.tsv` best parsed result per clip
-- `acoustid-all-candidates.tsv` every parsed AcoustID candidate per clip
-- `acoustid-submission.json` source submission response when enabled
-- `README.txt` run summary
+- `reports/summary.json`
+- `reports/summary.md`
 
-App runs additionally write:
+And usually also:
 
-- `reports/summary.json` combined machine-readable report
-- `reports/summary.md` readable summary with best match, scorecard, comments, and clip findings
-- Spotify runs also record `metadata.spotify_track_id`, `metadata.analysis_audio_source`, `metadata.preview_url`, and `metadata.matched_youtube_candidate`
-- Panako runs also record `panako_store` in the report and per-clip parsed Panako matches
+- `download/`
+- `clips/`
+- `fingerprints/`
+- `acoustid/`
+- `comments/`
+- transcript and excerpt artifacts under `reports/`
 
-## Current Limitations
+The machine-readable report is the source of truth. The Markdown summary is a readable explanation of the same evidence.
 
-- AcoustID is strongest for near-identical matches, not transformed or merely similar tracks.
-- SongRec is often stronger than AcoustID for mainstream catalog music, but it is still not guaranteed on obscure or synthetic material.
-- Spotify audio support depends on the public preview being exposed. When it is not, the app falls back to YouTube candidate search if enabled.
-- AI detection remains heuristic. The score is evidence, not proof.
+## Real-World Interpretation
 
-## Notes
+This app already demonstrated three different behaviors:
 
-- AcoustID is strongest when matching the original audio, not loosely similar songs or transformed mixes.
-- Long atmospheric uploads, AI-generated tracks, and heavily altered material often return raw result IDs with no recording metadata.
-- Source submission is best reserved for full known tracks; short clips from mixes are usually poor submission candidates.
-- The source assessment is heuristic. Treat `recognized_cataloged_track` as strong, and the other labels as triage signals backed by the scorecard rather than proof.
+- a known YouTube music video was identified cleanly as a catalog track
+- a Spotify track was identified from public metadata, preview audio, and matched YouTube source
+- a “Viking battle songs” style YouTube upload resisted both SongRec and AcoustID, which pushed the app toward `likely_ai_or_channel_original`
+
+That is the right mental model for this project:
+
+- sometimes you get a precise song ID
+- sometimes you only get a candidate
+- sometimes the most honest answer is “this looks like uncataloged or AI/channel-original material”
+
+## Limitations
+
+- `AcoustID` is not a general “recognize anything that sounds similar” engine.
+- `SongRec` is strong but still not universal.
+- Spotify support depends on public metadata and public preview availability.
+- AI scoring is heuristic, not proof.
+- Public databases are incomplete. Some misses are real misses, not bugs.
+
+## Roadmap Direction
+
+The repo already has the shape needed for deeper MIR and forensic work:
+
+- stronger local corpus workflows
+- better `audfprint` indexing and querying
+- deeper `Essentia` features such as melody, cover similarity, and embeddings
+- improved OCR and frame targeting
+- better explanation and ranking of candidate evidence
+
+If you care about one sentence summary:
+
+`ytdlpchop` is a free-first audio investigation toolkit that tries to identify tracks when possible, and explain the failure mode when identification is not possible.
