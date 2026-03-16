@@ -396,4 +396,4 @@ The repo already has the shape needed for deeper MIR and evidence-driven identif
 
 If you care about one sentence summary:
 
-`ytdlpchop` is a free-first audio identification engine that tries to name the track, rank the candidates, and show its evidence instead of bluffing.
+`ytdlpchop` is a free-first audio identification engine that tries to name the track, rank the candidates, and show the evidence behind its conclusions.
