@@ -1,6 +1,6 @@
-# ytdlpchop
+# ytdlpchopid
 
-`ytdlpchop` is a music identification app for messy sources:
+`ytdlpchopid` is a music identification app for messy sources:
 
 - YouTube uploads with no track list
 - long mixes and “war music” style compilations
@@ -25,7 +25,7 @@ The output is meant to answer three questions:
 
 ## What The App Actually Does
 
-The main CLI is [`bin/ytdlpchop`](/home/keith/Documents/code/ytdlpchop/bin/ytdlpchop).
+The main CLI is [`bin/ytdlpchopid`](/home/keith/Documents/code/ytdlpchopid/bin/ytdlpchopid).
 
 Given a source, it can:
 
@@ -34,14 +34,14 @@ Given a source, it can:
 - fingerprint each window
 - run multiple recognizers
 - pull transcript and metadata clues
-- score AI-like audio artifacts
+- build a multi-lane forensic matrix
 - summarize all of that into one report
 
-There is also an older Bash workflow at [`bin/yt_audio_id.sh`](/home/keith/Documents/code/ytdlpchop/bin/yt_audio_id.sh). It is still useful for raw AcoustID-oriented scanning, but the Python app is the real product now.
+There is also an older Bash workflow at [`bin/yt_audio_id.sh`](/home/keith/Documents/code/ytdlpchopid/bin/yt_audio_id.sh). It is still useful for raw AcoustID-oriented scanning, but the Python app is the real product now.
 
 ## Identification Strategy
 
-`ytdlpchop` uses layers, not one silver bullet.
+`ytdlpchopid` uses layers, not one silver bullet.
 
 ### 1. Direct audio recognizers
 
@@ -134,11 +134,21 @@ If `ffmpeg` can read it, the app can analyze it.
 
 This is the cleanest path when you already have the media locally.
 
-## Verdicts
+## Outputs
 
-The app emits a source-level `assessment` after combining all evidence.
+The app now emits two separate decisions for every file:
 
-Current labels:
+- `identity_assessment`
+- `synthetic_assessment`
+
+This split is intentional. A file can have:
+
+- strong identity evidence and low synthetic evidence
+- weak identity evidence and inconclusive synthetic evidence
+- no identity evidence and moderate synthetic evidence
+- strong identity evidence and strong synthetic evidence if it matches a known AI corpus item or synthetic family
+
+Identity labels:
 
 - `recognized_cataloged_track`
 - `candidate_match_found`
@@ -146,20 +156,46 @@ Current labels:
 - `likely_ai_or_channel_original`
 - `needs_manual_review`
 
-How to read them:
+Synthetic labels:
 
-- `recognized_cataloged_track`:
-  strong result, usually driven by repeated direct recognizer hits
-- `candidate_match_found`:
-  weak candidate, not confirmed enough to treat as solved
-- `likely_uncataloged_or_original`:
-  probably real music, but not cleanly identified in public systems
-- `likely_ai_or_channel_original`:
-  no direct recognizer hits plus supporting signals that this may be synthetic or house-made
-- `needs_manual_review`:
-  mixed evidence, no strong automatic answer yet
+- `low`
+- `inconclusive`
+- `probable`
+- `strong`
+- `insufficient_evidence`
 
-The app is intentionally conservative now: transcript-only MusicBrainz candidates are not allowed to masquerade as true IDs without some corroboration.
+The app is intentionally conservative in both directions. Transcript-only candidates are not treated as real IDs, and one noisy synthetic lane is not treated as proof.
+
+## Forensic Matrix
+
+When `--forensic-matrix` is enabled, or when `--ai-heuristics` is enabled, the report also includes a `forensic_matrix` block with separate lane scores.
+
+Stored file-level fields include:
+
+- `identity_score`
+- `synthetic_score`
+- `confidence_score`
+- `known_family_score`
+- `family_label`
+- `quality_class`
+- `top_evidence_for`
+- `top_evidence_against`
+- `lane_scores`
+- `lane_confidences`
+- `perturbation_stability`
+- `notes`
+
+The current matrix uses these lanes:
+
+- provenance
+- spectral artifacts
+- descriptor priors
+- structure
+- lyrics and speech
+- generator family
+- confidence and perturbation stability
+
+It also keeps identity separate through direct recognizers, local matching, and candidate aggregation.
 
 ## Scorecard
 
@@ -192,6 +228,8 @@ Spotify runs also include:
 - `youtube_candidate_count`
 
 Use the scorecard when you want to understand why the app identified something, refused to overclaim, or surfaced only a weak candidate.
+
+Use the forensic matrix when you want the AI/original-content side explained lane by lane.
 
 ## What Works Well
 
@@ -231,12 +269,12 @@ Useful optionals:
 - `tesseract`
 - Java for `Panako`
 
-Extra integrated source trees under [`external/`](/home/keith/Documents/code/ytdlpchop/external):
+Extra integrated source trees under [`external/`](/home/keith/Documents/code/ytdlpchopid/external):
 
-- [`external/Panako`](/home/keith/Documents/code/ytdlpchop/external/Panako)
-- [`external/audfprint`](/home/keith/Documents/code/ytdlpchop/external/audfprint)
-- [`external/demucs`](/home/keith/Documents/code/ytdlpchop/external/demucs)
-- [`external/essentia`](/home/keith/Documents/code/ytdlpchop/external/essentia)
+- [`external/Panako`](/home/keith/Documents/code/ytdlpchopid/external/Panako)
+- [`external/audfprint`](/home/keith/Documents/code/ytdlpchopid/external/audfprint)
+- [`external/demucs`](/home/keith/Documents/code/ytdlpchopid/external/demucs)
+- [`external/essentia`](/home/keith/Documents/code/ytdlpchopid/external/essentia)
 
 Not every vendored tool is equally wired into the app yet:
 
@@ -247,9 +285,9 @@ Not every vendored tool is equally wired into the app yet:
 
 ## Secrets
 
-Local secrets go in [`.env`](/home/keith/Documents/code/ytdlpchop/.env), which is gitignored.
+Local secrets go in [`.env`](/home/keith/Documents/code/ytdlpchopid/.env), which is gitignored.
 
-A safe template lives in [`.env.example`](/home/keith/Documents/code/ytdlpchop/.env.example).
+A safe template lives in [`.env.example`](/home/keith/Documents/code/ytdlpchopid/.env.example).
 
 Current env vars of interest:
 
@@ -261,7 +299,7 @@ Current env vars of interest:
 Minimal YouTube identification:
 
 ```bash
-bin/ytdlpchop identify \
+bin/ytdlpchopid identify \
   --songrec \
   --acoustid \
   -o out/basic \
@@ -272,13 +310,14 @@ Real YouTube identification run:
 
 ```bash
 source .env
-bin/ytdlpchop identify \
+bin/ytdlpchopid identify \
   --comments \
   --max-comments 40 \
   --focus-comments \
   --songrec \
   --acoustid \
   --ai-heuristics \
+  --forensic-matrix \
   --whisper \
   --musicbrainz \
   --panako \
@@ -291,11 +330,12 @@ Heavier run with stem separation:
 
 ```bash
 source .env
-bin/ytdlpchop identify \
+bin/ytdlpchopid identify \
   --comments \
   --songrec \
   --acoustid \
   --ai-heuristics \
+  --forensic-matrix \
   --demucs \
   --demucs-python .venv-demucs/bin/python3 \
   --whisper \
@@ -311,10 +351,11 @@ Spotify bridge run:
 
 ```bash
 source .env
-bin/ytdlpchop identify \
+bin/ytdlpchopid identify \
   --songrec \
   --acoustid \
   --ai-heuristics \
+  --forensic-matrix \
   --whisper \
   --musicbrainz \
   --panako \
@@ -326,7 +367,7 @@ bin/ytdlpchop identify \
 Local file run:
 
 ```bash
-bin/ytdlpchop identify \
+bin/ytdlpchopid identify \
   --songrec \
   --panako \
   --max-clips-per-profile 1 \
@@ -362,6 +403,16 @@ And usually also:
 
 The machine-readable report is the source of truth. The Markdown summary is the readable explanation of how the app got to its answer.
 
+Important machine-readable sections:
+
+- `identity_assessment`
+- `synthetic_assessment`
+- `forensic_matrix`
+- `scorecard`
+- `clips`
+- `transcripts`
+- `ocr`
+
 ## Real-World Interpretation
 
 This app already demonstrated three different behaviors:
@@ -381,7 +432,7 @@ That is the right mental model for this project:
 - `AcoustID` is not a general “recognize anything that sounds similar” engine.
 - `SongRec` is strong but still not universal.
 - Spotify support depends on public metadata and public preview availability.
-- AI scoring is heuristic, not proof.
+- Synthetic scoring is heuristic, multi-lane, and confidence-weighted. It is evidence, not proof.
 - Public databases are incomplete. Some misses are real misses, not bugs.
 
 ## Roadmap Direction
@@ -396,4 +447,4 @@ The repo already has the shape needed for deeper MIR and evidence-driven identif
 
 If you care about one sentence summary:
 
-`ytdlpchop` is a free-first audio identification engine that tries to name the track, rank the candidates, and show the evidence behind its conclusions.
+`ytdlpchopid` is a free-first audio identification engine that tries to name the track, rank the candidates, and show the evidence behind its conclusions.

@@ -11,6 +11,7 @@ import subprocess
 import sys
 import urllib.parse
 import urllib.request
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -517,6 +518,662 @@ def collect_evenly_spaced_timestamps(duration: int, count: int) -> list[int]:
     return [step * (idx + 1) for idx in range(count)]
 
 
+def clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
+    return max(low, min(high, value))
+
+
+def cosine_similarity(vec_a: np.ndarray, vec_b: np.ndarray) -> float:
+    denom = float(np.linalg.norm(vec_a) * np.linalg.norm(vec_b))
+    if denom <= 1e-9:
+        return 0.0
+    return float(np.dot(vec_a, vec_b) / denom)
+
+
+def local_minimum_baseline(values: np.ndarray, radius: int) -> np.ndarray:
+    if values.size == 0:
+        return values
+    baseline = np.empty_like(values)
+    for idx in range(values.size):
+        start = max(0, idx - radius)
+        stop = min(values.size, idx + radius + 1)
+        baseline[idx] = values[start:stop].min()
+    return baseline
+
+
+def frame_signal(samples: np.ndarray, frame_size: int, hop: int) -> np.ndarray | None:
+    if samples.size < frame_size:
+        return None
+    window = np.hanning(frame_size).astype(np.float32)
+    frames = []
+    for start in range(0, samples.size - frame_size + 1, hop):
+        frames.append(samples[start : start + frame_size] * window)
+    if not frames:
+        return None
+    return np.stack(frames)
+
+
+def compute_log_spectrum(frames: np.ndarray) -> np.ndarray:
+    spectrum = np.abs(np.fft.rfft(frames, axis=1))
+    return np.log1p(spectrum)
+
+
+def dominant_autocorr_strength(samples: np.ndarray, sample_rate: int, min_hz: float = 80.0, max_hz: float = 1000.0) -> float:
+    if samples.size < sample_rate:
+        return 0.0
+    usable = samples[: min(samples.size, sample_rate * 8)]
+    usable = usable - usable.mean()
+    corr = np.correlate(usable, usable, mode="full")[usable.size - 1 :]
+    if corr.size == 0 or corr[0] <= 1e-9:
+        return 0.0
+    min_lag = max(1, int(sample_rate / max_hz))
+    max_lag = min(corr.size - 1, int(sample_rate / min_hz))
+    if max_lag <= min_lag:
+        return 0.0
+    return float(np.max(corr[min_lag : max_lag + 1]) / corr[0])
+
+
+def render_ffmpeg_filter(source_path: Path, out_path: Path, filter_chain: str, sample_rate: int) -> Path | None:
+    ensure_dir(out_path.parent)
+    try:
+        run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                str(source_path),
+                "-vn",
+                "-af",
+                filter_chain,
+                "-ac",
+                "1",
+                "-ar",
+                str(sample_rate),
+                str(out_path),
+            ],
+            capture=False,
+        )
+    except subprocess.CalledProcessError:
+        return None
+    return out_path if out_path.exists() else None
+
+
+def analyze_spectral_artifact_lane(samples: np.ndarray, sample_rate: int) -> dict[str, Any] | None:
+    usable = samples[: min(samples.size, sample_rate * 60)]
+    frames = frame_signal(usable, 4096, 1024)
+    if frames is None:
+        return None
+    spectrum = np.abs(np.fft.rfft(frames, axis=1))
+    freqs = np.fft.rfftfreq(4096, d=1.0 / sample_rate)
+    high_hz = min(16000.0, (sample_rate / 2.0) - 100.0)
+    if high_hz <= 5200.0:
+        return None
+    band_mask = (freqs >= 5000.0) & (freqs <= high_hz)
+    band_freqs = freqs[band_mask]
+    band_spectrum = spectrum[:, band_mask]
+    if band_spectrum.shape[1] < 32:
+        return None
+
+    avg_spectrum = band_spectrum.mean(axis=0)
+    baseline = local_minimum_baseline(avg_spectrum, 10)
+    residual = np.maximum(avg_spectrum - baseline, 0.0)
+    threshold = float(residual.mean() + (1.75 * residual.std()))
+    prominent = np.where(residual > threshold)[0]
+    if prominent.size:
+        prominences = residual[prominent]
+        persistent_hits = []
+        for idx in prominent:
+            per_frame_threshold = float(band_spectrum[:, idx].mean() + (1.25 * band_spectrum[:, idx].std()))
+            persistent_hits.append(float(np.mean(band_spectrum[:, idx] > per_frame_threshold)))
+        persistence = float(np.mean(persistent_hits))
+        mean_prominence = float(np.mean(prominences))
+    else:
+        persistence = 0.0
+        mean_prominence = 0.0
+
+    spacings = np.diff(band_freqs[prominent]) if prominent.size >= 2 else np.array([], dtype=np.float32)
+    dominant_spacing_hz = 0.0
+    spacing_regularity = 0.0
+    if spacings.size:
+        rounded = np.round(spacings / 10.0) * 10.0
+        unique, counts = np.unique(rounded, return_counts=True)
+        dominant_idx = int(np.argmax(counts))
+        dominant_spacing_hz = float(unique[dominant_idx])
+        spacing_regularity = float(counts[dominant_idx] / len(spacings))
+
+    peak_density = float(prominent.size / max(band_spectrum.shape[1], 1))
+    residual_ratio = float(residual.mean() / (baseline.mean() + 1e-9))
+    band_prominence = {}
+    for low_hz, high_hz, label in ((0.0, 5000.0, "0_5k"), (5000.0, 10000.0, "5_10k"), (10000.0, high_hz, "10_16k")):
+        mask = (freqs >= low_hz) & (freqs < high_hz)
+        if np.any(mask):
+            sub = spectrum[:, mask].mean(axis=0)
+            sub_base = local_minimum_baseline(sub, min(10, max(2, sub.size // 32)))
+            band_prominence[label] = round(float(np.maximum(sub - sub_base, 0.0).mean()), 4)
+    score = clamp(
+        (persistence * 0.40)
+        + (spacing_regularity * 0.25)
+        + min(0.20, mean_prominence * 0.12)
+        + min(0.15, peak_density * 10.0)
+        + min(0.10, residual_ratio * 0.6)
+    )
+    family_hint = "none"
+    if score >= 0.62 and spacing_regularity >= 0.45 and prominent.size >= 18:
+        family_hint = "encodec_like_upsampler_signature"
+    elif score >= 0.48 and prominent.size >= 12:
+        family_hint = "unknown_synthetic_family"
+    return {
+        "score": round(score, 4),
+        "peak_count": int(prominent.size),
+        "peak_density": round(peak_density, 6),
+        "mean_peak_prominence": round(mean_prominence, 4),
+        "peak_persistence": round(persistence, 4),
+        "spacing_regularity": round(spacing_regularity, 4),
+        "dominant_spacing_hz": round(dominant_spacing_hz, 2),
+        "residual_ratio": round(residual_ratio, 4),
+        "family_hint": family_hint,
+        "band_prominence": band_prominence,
+        "analysis_band_hz": [5000, int(high_hz)],
+    }
+
+
+def analyze_short_window_profile(samples: np.ndarray, sample_rate: int, window_seconds: int = 5, hop_seconds: int = 1) -> dict[str, Any] | None:
+    window = sample_rate * window_seconds
+    hop = sample_rate * hop_seconds
+    if samples.size < window:
+        return None
+    scores: list[float] = []
+    for start in range(0, samples.size - window + 1, hop):
+        lane = analyze_spectral_artifact_lane(samples[start : start + window], sample_rate)
+        if lane:
+            scores.append(float(lane["score"]))
+    if not scores:
+        return None
+    arr = np.array(scores, dtype=np.float32)
+    return {
+        "window_seconds": window_seconds,
+        "hop_seconds": hop_seconds,
+        "window_count": int(arr.size),
+        "mean_score": round(float(arr.mean()), 4),
+        "max_score": round(float(arr.max()), 4),
+        "active_window_ratio": round(float(np.mean(arr >= 0.4)), 4),
+    }
+
+
+def analyze_distributional_lane(samples: np.ndarray, sample_rate: int, duration: int) -> dict[str, Any] | None:
+    usable = samples[: min(samples.size, sample_rate * 90)]
+    frames = frame_signal(usable, 4096, 1024)
+    if frames is None:
+        return None
+    spectrum = np.abs(np.fft.rfft(frames, axis=1))
+    freqs = np.fft.rfftfreq(4096, d=1.0 / sample_rate)
+    energy = spectrum.sum(axis=1) + 1e-9
+    centroids = (spectrum * freqs).sum(axis=1) / energy
+    norm_centroid = float(np.mean(centroids) / (sample_rate / 2.0))
+    spectral_diff = np.diff(np.log1p(spectrum), axis=0)
+    flux = np.maximum(spectral_diff, 0.0).sum(axis=1)
+    pitch_salience = dominant_autocorr_strength(usable, sample_rate)
+    duration_suspicion = 0.0
+    if 120 <= duration <= 360:
+        duration_suspicion = 0.35
+        if duration % 5 == 0:
+            duration_suspicion += 0.15
+    score = clamp(
+        max(0.0, 0.34 - norm_centroid) * 1.7
+        + max(0.0, 0.36 - pitch_salience) * 1.2
+        + min(0.15, float(np.mean(flux)) * 0.015)
+        + min(0.10, duration_suspicion)
+    )
+    return {
+        "score": round(score, 4),
+        "spectral_centroid_normalized": round(norm_centroid, 4),
+        "spectral_centroid_hz": round(float(np.mean(centroids)), 2),
+        "spectral_flux_mean": round(float(np.mean(flux)), 4),
+        "pitch_salience_proxy": round(pitch_salience, 4),
+        "duration_suspicion": round(duration_suspicion, 4),
+    }
+
+
+def analyze_structure_lane(samples: np.ndarray, sample_rate: int) -> dict[str, Any] | None:
+    usable = samples[: min(samples.size, sample_rate * 120)]
+    frames = frame_signal(usable, 4096, 1024)
+    if frames is None:
+        return None
+    log_spectrum = compute_log_spectrum(frames)
+    novelty = np.maximum(np.diff(log_spectrum, axis=0), 0.0).sum(axis=1)
+    if novelty.size < 8:
+        return None
+    novelty = novelty / (np.max(novelty) + 1e-9)
+    threshold = float(novelty.mean() + novelty.std())
+    peak_positions = [idx for idx in range(1, novelty.size - 1) if novelty[idx] > threshold and novelty[idx] > novelty[idx - 1] and novelty[idx] > novelty[idx + 1]]
+    intervals = np.diff(peak_positions) if len(peak_positions) >= 2 else np.array([], dtype=np.float32)
+    section_regularity = 0.0
+    microtiming_rigidity = 0.0
+    if intervals.size:
+        cv = float(np.std(intervals) / (np.mean(intervals) + 1e-9))
+        section_regularity = clamp(1.0 - min(cv, 1.0))
+        microtiming_rigidity = clamp(1.0 - min(cv * 1.2, 1.0))
+    centered = novelty - novelty.mean()
+    autocorr = np.correlate(centered, centered, mode="full")[centered.size - 1 :]
+    repetition_density = 0.0
+    if autocorr.size > 8 and autocorr[0] > 1e-9:
+        repetition_density = float(np.max(autocorr[4:]) / autocorr[0])
+    rms = np.sqrt(np.mean(frames**2, axis=1))
+    tail_window = min(max(2, sample_rate // 1024), rms.size // 3 if rms.size >= 3 else 1)
+    tail_realism = 0.0
+    if tail_window >= 1 and rms.size >= tail_window * 2:
+        before_tail = float(np.mean(rms[-(tail_window * 2) : -tail_window]))
+        tail = float(np.mean(rms[-tail_window:]))
+        tail_realism = clamp(1.0 - min(1.0, tail / (before_tail + 1e-9)))
+    transition_sharpness = clamp(float(np.percentile(novelty, 95) / (np.mean(novelty) + 1e-9)) / 6.0)
+    score = clamp(
+        (section_regularity * 0.28)
+        + (repetition_density * 0.28)
+        + (tail_realism * 0.22)
+        + (transition_sharpness * 0.12)
+        + (microtiming_rigidity * 0.10)
+    )
+    return {
+        "score": round(score, 4),
+        "section_regularity": round(section_regularity, 4),
+        "repetition_density": round(repetition_density, 4),
+        "tail_realism": round(tail_realism, 4),
+        "transition_sharpness": round(transition_sharpness, 4),
+        "microtiming_rigidity": round(microtiming_rigidity, 4),
+        "novelty_peak_count": int(len(peak_positions)),
+    }
+
+
+def analyze_lyrics_lane(transcripts: list[dict[str, Any]], stems: dict[str, str] | None) -> dict[str, Any]:
+    text_items = [(item.get("label") or "source", item.get("text") or "") for item in transcripts if item.get("text")]
+    if not text_items:
+        return {
+            "score": 0.0,
+            "token_count": 0,
+            "lexical_repetition": 0.0,
+            "line_repetition": 0.0,
+            "bracket_token_ratio": 0.0,
+            "source_vocals_overlap": 0.0,
+            "speech_feature_score": 0.0,
+        }
+    all_text = " ".join(text for _, text in text_items)
+    tokens = re.findall(r"[a-zA-Z']+", all_text.lower())
+    token_count = len(tokens)
+    counts = Counter(tokens)
+    lexical_repetition = 0.0
+    if token_count:
+        lexical_repetition = float(1.0 - (len(counts) / token_count))
+    lines = [line.strip().lower() for _, text in text_items for line in re.split(r"[\n\r]+", text) if line.strip()]
+    line_counts = Counter(lines)
+    repeated_lines = sum(count for _, count in line_counts.items() if count > 1)
+    line_repetition = float(repeated_lines / max(len(lines), 1))
+    repeated_ngram_ratio = 0.0
+    if token_count >= 6:
+        ngrams = [" ".join(tokens[idx : idx + 3]) for idx in range(len(tokens) - 2)]
+        ngram_counts = Counter(ngrams)
+        repeated_ngrams = sum(count for _, count in ngram_counts.items() if count > 1)
+        repeated_ngram_ratio = float(repeated_ngrams / max(len(ngrams), 1))
+    bracket_tokens = re.findall(r"\[[^\]]+\]", all_text)
+    bracket_token_ratio = float(len(bracket_tokens) / max(token_count, 1))
+    overlap = 0.0
+    source_text = " ".join(text for label, text in text_items if label == "source")
+    vocals_text = " ".join(text for label, text in text_items if label == "vocals")
+    if source_text and vocals_text:
+        source_set = set(re.findall(r"[a-zA-Z']+", source_text.lower()))
+        vocals_set = set(re.findall(r"[a-zA-Z']+", vocals_text.lower()))
+        overlap = float(len(source_set & vocals_set) / max(len(source_set | vocals_set), 1))
+    speech_feature_score = 0.0
+    if stems and stems.get("vocals"):
+        vocals_samples = extract_pcm_mono(Path(stems["vocals"]), 16000)
+        if vocals_samples.size:
+            speech_feature_score = clamp(float(np.sqrt(np.mean(vocals_samples**2))) * 8.0)
+    score = clamp(
+        (lexical_repetition * 0.25)
+        + (line_repetition * 0.20)
+        + (repeated_ngram_ratio * 0.25)
+        + min(0.15, bracket_token_ratio * 4.0)
+        + max(0.0, 0.55 - overlap) * 0.20
+        + (speech_feature_score * 0.05)
+    )
+    return {
+        "score": round(score, 4),
+        "token_count": token_count,
+        "lexical_repetition": round(lexical_repetition, 4),
+        "line_repetition": round(line_repetition, 4),
+        "repeated_ngram_ratio": round(repeated_ngram_ratio, 4),
+        "bracket_token_ratio": round(bracket_token_ratio, 4),
+        "source_vocals_overlap": round(overlap, 4),
+        "speech_feature_score": round(speech_feature_score, 4),
+    }
+
+
+def detect_c2pa_provenance(source_path: Path) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "tool_available": command_exists("c2patool"),
+        "manifest_hint": False,
+        "verified": False,
+        "validation_state": None,
+        "active_manifest": None,
+    }
+    if result["tool_available"]:
+        try:
+            proc = run(["c2patool", str(source_path)])
+            output = proc.stdout.strip()
+            try:
+                data = json.loads(output)
+                manifests = data.get("active_manifest") or data.get("manifests") or data
+                validation_state = recursive_text_values(data)
+                result["manifest_hint"] = True
+                result["active_manifest"] = manifests
+                result["validation_state"] = next((text for text in validation_state if "valid" in text.lower()), None)
+                result["verified"] = bool(result["validation_state"])
+                return result
+            except json.JSONDecodeError:
+                lowered = output.lower()
+                result["manifest_hint"] = "c2pa" in lowered or "content credentials" in lowered
+                result["verified"] = "valid" in lowered
+                result["validation_state"] = "Valid" if result["verified"] else None
+                return result
+        except Exception:
+            pass
+    try:
+        raw = source_path.read_bytes()[: 1024 * 1024]
+        lowered = raw.lower()
+        result["manifest_hint"] = b"c2pa" in lowered or b"content credentials" in lowered
+    except Exception:
+        pass
+    return result
+
+
+def build_identity_lane(scorecard: dict[str, Any], songrec_top: dict[str, Any] | None, acoustid_top: dict[str, Any] | None, musicbrainz_top: dict[str, Any] | None) -> dict[str, Any]:
+    score = 0.0
+    evidence: list[str] = []
+    if songrec_top and scorecard["songrec_hit_count"] >= 2:
+        score = 25.0
+        evidence.append("Repeated SongRec/Shazam matches")
+    elif acoustid_top and acoustid_top.get("recording_id"):
+        score = 18.0
+        evidence.append("AcoustID recording match")
+    else:
+        score += min(8.0, scorecard["panako_hit_count"] * 2.0)
+        score += min(5.0, scorecard["corpus_match_count"] * 1.5)
+        if musicbrainz_top and scorecard["musicbrainz_candidate_count"] > 0:
+            score += 4.0
+            evidence.append("MusicBrainz candidates")
+        if scorecard["raw_acoustid_hit_count"] > 0:
+            score += 3.0
+            evidence.append("Raw AcoustID hits")
+        if scorecard["panako_hit_count"] > 0:
+            evidence.append("Panako local matches")
+        if scorecard["corpus_match_count"] > 0:
+            evidence.append("Local corpus matches")
+    return {
+        "score": round(min(25.0, score), 2),
+        "label": "exact_or_strong" if score >= 18.0 else "weak_or_candidate" if score >= 6.0 else "none",
+        "evidence": evidence,
+    }
+
+
+def build_generator_family_lane(provenance: dict[str, Any], spectral_lane: dict[str, Any] | None) -> dict[str, Any]:
+    known_signals = [signal for signal in provenance.get("provenance_signals") or [] if signal in {"suno", "udio", "synthid"}]
+    if known_signals:
+        family = known_signals[0]
+        return {
+            "score": 10.0,
+            "label": "known_family",
+            "family": family,
+            "evidence": [f"Metadata/provenance mentions {family}"],
+        }
+    if spectral_lane and spectral_lane.get("family_hint") == "encodec_like_upsampler_signature":
+        return {
+            "score": 7.5,
+            "label": "known_architecture_hint",
+            "family": "encodec_like_upsampler_signature",
+            "evidence": ["High-frequency artifact spacing resembles an upsampler/deconvolution family"],
+        }
+    if spectral_lane and spectral_lane.get("family_hint") == "unknown_synthetic_family":
+        return {
+            "score": 5.0,
+            "label": "unknown_synthetic_family",
+            "family": "unknown_synthetic_family",
+            "evidence": ["Persistent high-frequency artifact family detected without a known label"],
+        }
+    return {
+        "score": 0.0,
+        "label": "none",
+        "family": None,
+        "evidence": [],
+    }
+
+
+def analyze_confidence_lane(
+    source_excerpt: Path,
+    excerpt_seconds: int,
+    scorecard: dict[str, Any],
+    spectral_lane: dict[str, Any] | None,
+    outdir: Path,
+) -> dict[str, Any]:
+    multiplier = 1.0 if excerpt_seconds >= 60 else 0.90 if excerpt_seconds > 20 else 0.75
+    penalties: list[str] = []
+    if excerpt_seconds <= 20:
+        penalties.append("short_excerpt")
+    elif excerpt_seconds < 60:
+        penalties.append("clean_excerpt")
+    else:
+        penalties.append("clean_full_track")
+
+    perturbation_scores: dict[str, float] = {}
+    perturbation_stability = 1.0
+    if spectral_lane:
+        base_score = spectral_lane.get("score") or 0.0
+        perturb_root = outdir / "reports" / "perturbations"
+        filters = {
+            "lowpass_9k": "lowpass=f=9000",
+            "resample_22k": "aresample=22050",
+            "pitch_up_1st": "asetrate=32000*1.059463,aresample=32000",
+        }
+        diffs = []
+        for label, filter_chain in filters.items():
+            perturbed = render_ffmpeg_filter(source_excerpt, perturb_root / f"{source_excerpt.stem}_{label}.flac", filter_chain, 32000)
+            if not perturbed:
+                continue
+            perturbed_samples = extract_pcm_mono(perturbed, 32000)
+            perturbed_lane = analyze_spectral_artifact_lane(perturbed_samples, 32000)
+            if not perturbed_lane:
+                continue
+            perturbation_scores[label] = round(float(perturbed_lane["score"]), 4)
+            diffs.append(abs(float(perturbed_lane["score"]) - base_score))
+        if diffs:
+            perturbation_stability = clamp(1.0 - (float(np.mean(diffs)) / max(base_score, 0.2)))
+            if perturbation_stability < 0.55:
+                multiplier = min(multiplier, 0.50)
+                penalties.append("artifact_fragile_under_perturbation")
+            elif perturbation_stability < 0.75:
+                multiplier = min(multiplier, 0.75)
+                penalties.append("artifact_somewhat_fragile")
+
+    if scorecard["songrec_hit_count"] == 0 and scorecard["acoustid_recording_hit_count"] == 0 and scorecard["transcript_hit_count"] == 0:
+        multiplier = min(multiplier, 0.60)
+        penalties.append("limited_multi_lane_support")
+
+    confidence_class = "high" if multiplier >= 0.9 else "medium" if multiplier >= 0.72 else "low"
+    return {
+        "multiplier": round(multiplier, 4),
+        "class": confidence_class,
+        "penalties": penalties,
+        "perturbation_stability": round(perturbation_stability, 4),
+        "perturbation_scores": perturbation_scores,
+    }
+
+
+def build_forensic_matrix(
+    assets: SourceAssets,
+    source_excerpt: Path,
+    excerpt_seconds: int,
+    ffprobe_data: dict[str, Any],
+    provenance: dict[str, Any],
+    transcripts: list[dict[str, Any]],
+    stems: dict[str, str] | None,
+    scorecard: dict[str, Any],
+    songrec_top: dict[str, Any] | None,
+    acoustid_top: dict[str, Any] | None,
+    musicbrainz_top: dict[str, Any] | None,
+    outdir: Path,
+) -> dict[str, Any] | None:
+    samples = extract_pcm_mono(source_excerpt, 32000)
+    if samples.size < 32000 * 8:
+        return None
+    spectral_lane = analyze_spectral_artifact_lane(samples, 32000)
+    distribution_lane = analyze_distributional_lane(samples, 32000, assets.duration)
+    structure_lane = analyze_structure_lane(samples, 32000)
+    short_window_profile = analyze_short_window_profile(samples, 32000)
+    lyrics_lane = analyze_lyrics_lane(transcripts, stems)
+    c2pa = detect_c2pa_provenance(assets.audio_path)
+    provenance_lane = {
+        "score": 0.0,
+        "label": "neutral",
+        "signals": provenance.get("provenance_signals") or [],
+        "c2pa": c2pa,
+    }
+    if c2pa.get("verified"):
+        provenance_lane["score"] = 25.0
+        provenance_lane["label"] = "verified_provenance"
+    elif c2pa.get("manifest_hint") or provenance.get("provenance_signal_count"):
+        provenance_lane["score"] = 10.0
+        provenance_lane["label"] = "provenance_hints"
+    generator_family_lane = build_generator_family_lane(provenance, spectral_lane)
+    identity_lane = build_identity_lane(scorecard, songrec_top, acoustid_top, musicbrainz_top)
+    confidence_lane = analyze_confidence_lane(source_excerpt, excerpt_seconds, scorecard, spectral_lane, outdir)
+    lane_scores = {
+        "provenance": round(float(provenance_lane["score"]), 2),
+        "spectral_artifacts": round(25.0 * float((spectral_lane or {}).get("score", 0.0)), 2),
+        "descriptor_priors": round(8.0 * float((distribution_lane or {}).get("score", 0.0)), 2),
+        "structure": round(15.0 * float((structure_lane or {}).get("score", 0.0)), 2),
+        "lyrics_speech": round(22.0 * float((lyrics_lane or {}).get("score", 0.0)), 2),
+        "generator_family": round(float(generator_family_lane["score"]), 2),
+    }
+    if short_window_profile and short_window_profile["active_window_ratio"] < 0.2 and lane_scores["spectral_artifacts"] < 12.0:
+        confidence_lane["multiplier"] = min(confidence_lane["multiplier"], 0.60)
+        confidence_lane["class"] = "low" if confidence_lane["multiplier"] < 0.72 else confidence_lane["class"]
+        confidence_lane["penalties"].append("weak_short_window_support")
+    lane_confidences = {
+        "provenance": 100 if provenance_lane["label"] == "verified_provenance" else 55 if provenance_lane["label"] == "provenance_hints" else 25,
+        "spectral_artifacts": int(round(100 * float((spectral_lane or {}).get("peak_persistence", 0.0)))),
+        "descriptor_priors": 40,
+        "structure": 60 if structure_lane else 20,
+        "lyrics_speech": 75 if lyrics_lane.get("token_count") else 20,
+        "generator_family": 85 if generator_family_lane["label"] == "known_family" else 60 if generator_family_lane["label"] != "none" else 20,
+    }
+
+    raw_score = (
+        float(provenance_lane["score"])
+        + (25.0 * float((spectral_lane or {}).get("score", 0.0)))
+        + (8.0 * float((distribution_lane or {}).get("score", 0.0)))
+        + (15.0 * float((structure_lane or {}).get("score", 0.0)))
+        + (22.0 * float((lyrics_lane or {}).get("score", 0.0)))
+        + float(generator_family_lane["score"])
+    )
+    strong_lane_count = sum(
+        1
+        for value in (
+            lane_scores["provenance"],
+            lane_scores["spectral_artifacts"],
+            lane_scores["structure"],
+            lane_scores["lyrics_speech"],
+            lane_scores["generator_family"],
+        )
+        if value >= 12.0
+    )
+    confidence_cap = 100 if provenance_lane["label"] == "verified_provenance" or strong_lane_count >= 3 else 80 if strong_lane_count >= 2 else 55 if strong_lane_count >= 1 else 35
+    adjusted_score = clamp((raw_score / 100.0) * confidence_lane["multiplier"]) * 100.0
+    if lane_scores["spectral_artifacts"] >= 17.5 and strong_lane_count <= 1:
+        adjusted_score = min(adjusted_score, 75.0)
+    confidence_score = min(confidence_cap, int(round(confidence_lane["multiplier"] * 100)))
+    synthetic_label = (
+        "high_confidence_synthetic"
+        if adjusted_score >= 80.0
+        else "strong_synthetic_evidence"
+        if adjusted_score >= 65.0
+        else "probable_synthetic_or_ai_mediated"
+        if adjusted_score >= 45.0
+        else "weak_suspicion_or_inconclusive"
+        if adjusted_score >= 25.0
+        else "no_meaningful_synthetic_evidence"
+    )
+    if scorecard["songrec_hit_count"] >= 2 and identity_lane["score"] >= 25.0:
+        adjusted_score = min(adjusted_score, 22.0)
+        synthetic_label = "low_synthetic_likelihood_due_to_strong_identity_match"
+
+    top_evidence_for = []
+    if provenance_lane["label"] != "neutral":
+        top_evidence_for.append(f"Provenance lane: {provenance_lane['label']}")
+    if spectral_lane and lane_scores["spectral_artifacts"] >= 10.0:
+        top_evidence_for.append(
+            f"Spectral artifacts: {spectral_lane['peak_count']} persistent high-band peaks, regularity={spectral_lane['spacing_regularity']}"
+        )
+    if lyrics_lane.get("score", 0.0) >= 0.35:
+        top_evidence_for.append(
+            f"Lyrics/speech lane: repetition={lyrics_lane['lexical_repetition']}, overlap={lyrics_lane['source_vocals_overlap']}"
+        )
+    if structure_lane and lane_scores["structure"] >= 7.5:
+        top_evidence_for.append(
+            f"Structure lane: repetition={structure_lane['repetition_density']}, tail_realism={structure_lane['tail_realism']}"
+        )
+    if generator_family_lane["label"] != "none":
+        top_evidence_for.append(f"Generator family: {generator_family_lane['family']}")
+
+    top_evidence_against = []
+    if identity_lane["score"] >= 18.0:
+        top_evidence_against.append(f"Strong identity evidence: {identity_lane['evidence'][:2]}")
+    if confidence_lane["perturbation_stability"] < 0.6:
+        top_evidence_against.append("Artifact lane is fragile under mild perturbations")
+    if lane_scores["lyrics_speech"] < 4.0:
+        top_evidence_against.append("Lyrics/speech lane is weak or unavailable")
+    if lane_scores["structure"] < 4.0:
+        top_evidence_against.append("Structure lane is weak on the analyzed excerpt")
+
+    quality_class = "clean_full_track" if excerpt_seconds >= assets.duration - 2 else "clean_excerpt"
+    if "artifact_fragile_under_perturbation" in confidence_lane["penalties"]:
+        quality_class = "heavily_transcoded"
+    elif lyrics_lane.get("speech_feature_score", 0.0) >= 0.3 and lyrics_lane.get("source_vocals_overlap", 1.0) < 0.4:
+        quality_class = "masked"
+    elif excerpt_seconds < 20:
+        quality_class = "clean_excerpt"
+
+    return {
+        "identity_score": int(round(identity_lane["score"] * 4.0)),
+        "synthetic_score": int(round(adjusted_score)),
+        "confidence_score": confidence_score,
+        "known_family_score": int(round(min(100.0, generator_family_lane["score"] * 10.0))),
+        "family_label": "known" if generator_family_lane["label"] in {"known_family", "known_architecture_hint"} else "unknown" if generator_family_lane["label"] == "unknown_synthetic_family" else "none",
+        "quality_class": quality_class,
+        "top_evidence_for": top_evidence_for[:5],
+        "top_evidence_against": top_evidence_against[:5],
+        "lane_scores": lane_scores,
+        "lane_confidences": lane_confidences,
+        "perturbation_stability": confidence_lane["perturbation_stability"],
+        "notes": confidence_lane["penalties"],
+        "analysis_excerpt_path": str(source_excerpt),
+        "analysis_excerpt_seconds": excerpt_seconds,
+        "identity_lane": identity_lane,
+        "provenance_lane": provenance_lane,
+        "spectral_artifact_lane": spectral_lane,
+        "distributional_acoustics_lane": distribution_lane,
+        "structural_lane": structure_lane,
+        "short_window_profile": short_window_profile,
+        "lyrics_speech_lane": lyrics_lane,
+        "generator_family_lane": generator_family_lane,
+        "confidence_lane": confidence_lane,
+        "synthetic_likelihood": {
+            "raw_score": round(raw_score, 2),
+            "adjusted_score": round(adjusted_score, 2),
+            "label": synthetic_label,
+        },
+    }
+
+
 def shell_join_command(template: str, replacements: dict[str, str]) -> list[str]:
     rendered = template.format(**replacements)
     return ["bash", "-lc", rendered]
@@ -621,77 +1278,26 @@ def panako_query_clip(jar_path: Path, reports_dir: Path, strategy: str, clip_pat
     }
 
 
-def score_ai_audio_artifacts(audio_path: Path, sample_rate: int = 16000) -> dict[str, Any] | None:
+def score_ai_audio_artifacts(audio_path: Path, sample_rate: int = 32000) -> dict[str, Any] | None:
     samples = extract_pcm_mono(audio_path, sample_rate)
-    if samples.size < sample_rate * 8:
+    spectral_lane = analyze_spectral_artifact_lane(samples, sample_rate)
+    if not spectral_lane:
         return None
-
-    # Trim to a stable mid-section to avoid intros/outros skewing the score.
-    usable = samples[: min(samples.size, sample_rate * 60)]
-    frame_size = 4096
-    hop = 1024
-    if usable.size < frame_size:
-        return None
-
-    window = np.hanning(frame_size).astype(np.float32)
-    frames = []
-    for start in range(0, usable.size - frame_size + 1, hop):
-        frames.append(usable[start : start + frame_size] * window)
-    if not frames:
-        return None
-    frame_matrix = np.stack(frames)
-    spectrum = np.abs(np.fft.rfft(frame_matrix, axis=1))
-    avg_spectrum = spectrum.mean(axis=0)
-    freqs = np.fft.rfftfreq(frame_size, d=1.0 / sample_rate)
-
-    band_mask = (freqs >= 80.0) & (freqs <= 7800.0)
-    band_spectrum = avg_spectrum[band_mask]
-    band_freqs = freqs[band_mask]
-    if band_spectrum.size < 32:
-        return None
-
-    baseline = np.convolve(band_spectrum, np.ones(31, dtype=np.float32) / 31.0, mode="same")
-    residual = np.maximum(band_spectrum - baseline, 0.0)
-    residual_mean = float(residual.mean())
-    residual_std = float(residual.std())
-    threshold = residual_mean + (2.5 * residual_std)
-
-    peak_indices: list[int] = []
-    for idx in range(1, residual.size - 1):
-        if residual[idx] > threshold and residual[idx] > residual[idx - 1] and residual[idx] > residual[idx + 1]:
-            peak_indices.append(idx)
-
-    peak_freqs = band_freqs[peak_indices]
-    spacings = np.diff(peak_freqs) if peak_freqs.size >= 2 else np.array([], dtype=np.float32)
-    periodicity_strength = 0.0
-    dominant_spacing_hz = 0.0
-    if spacings.size:
-        rounded = np.round(spacings / 5.0) * 5.0
-        unique, counts = np.unique(rounded, return_counts=True)
-        dominant_idx = int(np.argmax(counts))
-        dominant_spacing_hz = float(unique[dominant_idx])
-        periodicity_strength = float(counts[dominant_idx] / max(len(spacings), 1))
-
-    peak_density = float(len(peak_indices) / max(len(band_spectrum), 1))
-    residual_ratio = float(residual.mean() / (baseline.mean() + 1e-9))
-
-    score = min(
-        1.0,
-        (periodicity_strength * 0.55)
-        + min(0.25, peak_density * 18.0)
-        + min(0.20, residual_ratio * 0.8),
-    )
+    score = float(spectral_lane["score"])
     label = "high" if score >= 0.65 else "medium" if score >= 0.4 else "low"
     return {
         "artifact_score": round(score, 4),
         "artifact_label": label,
-        "peak_count": int(len(peak_indices)),
-        "peak_density": round(peak_density, 6),
-        "periodicity_strength": round(periodicity_strength, 4),
-        "dominant_spacing_hz": round(dominant_spacing_hz, 2),
-        "residual_ratio": round(residual_ratio, 4),
+        "peak_count": spectral_lane["peak_count"],
+        "peak_density": spectral_lane["peak_density"],
+        "periodicity_strength": spectral_lane["spacing_regularity"],
+        "dominant_spacing_hz": spectral_lane["dominant_spacing_hz"],
+        "residual_ratio": spectral_lane["residual_ratio"],
+        "mean_peak_prominence": spectral_lane["mean_peak_prominence"],
+        "peak_persistence": spectral_lane["peak_persistence"],
+        "family_hint": spectral_lane["family_hint"],
         "sample_rate": sample_rate,
-        "analysis_seconds": round(len(usable) / sample_rate, 2),
+        "analysis_seconds": round(min(samples.size, sample_rate * 60) / sample_rate, 2),
     }
 
 
@@ -867,7 +1473,7 @@ def musicbrainz_recording_search(phrase: str, limit: int = 5) -> list[dict[str, 
     url = f"https://musicbrainz.org/ws/2/recording?{query}"
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "ytdlpchop/0.1 (https://example.invalid/contact)"},
+        headers={"User-Agent": "ytdlpchopid/0.1 (https://example.invalid/contact)"},
     )
     with urllib.request.urlopen(req, timeout=20) as response:
         data = json.loads(response.read().decode("utf-8"))
@@ -1182,6 +1788,33 @@ def classify_source(
     }
 
 
+def classify_synthetic(forensic_matrix: dict[str, Any] | None) -> dict[str, Any]:
+    if not forensic_matrix:
+        return {
+            "label": "insufficient_evidence",
+            "confidence": "low",
+            "reason": "No forensic matrix could be computed from the available audio.",
+        }
+    synthetic_score = forensic_matrix["synthetic_score"]
+    confidence_score = forensic_matrix["confidence_score"]
+    label = (
+        "strong"
+        if synthetic_score >= 60
+        else "probable"
+        if synthetic_score >= 40
+        else "inconclusive"
+        if synthetic_score >= 20
+        else "low"
+    )
+    confidence = "high" if confidence_score >= 70 else "medium" if confidence_score >= 35 else "low"
+    reason = "; ".join(forensic_matrix.get("top_evidence_for")[:3]) or "No synthetic lane accumulated strong evidence."
+    return {
+        "label": label,
+        "confidence": confidence,
+        "reason": reason,
+    }
+
+
 def identify(args: argparse.Namespace) -> int:
     outdir = Path(args.outdir).resolve()
     ensure_dir(outdir)
@@ -1278,6 +1911,15 @@ def identify(args: argparse.Namespace) -> int:
                             break
                     transcript["musicbrainz_candidates"] = mb_candidates[: args.musicbrainz_limit]
                 transcripts.append(transcript)
+
+    matrix_excerpt, matrix_excerpt_start = prepare_analysis_excerpt(
+        assets.audio_path,
+        outdir,
+        "forensic_excerpt",
+        assets.duration,
+        comment_timestamps,
+        args.forensic_excerpt_seconds,
+    )
 
     panako_jar: Path | None = None
     panako_store_info: dict[str, Any] | None = None
@@ -1421,7 +2063,44 @@ def identify(args: argparse.Namespace) -> int:
         provenance,
         transcripts,
     )
-    summary["assessment"] = classify_source(summary["scorecard"], songrec_top, acoustid_top, musicbrainz_top)
+    forensic_matrix = None
+    if args.forensic_matrix or args.ai_heuristics:
+        forensic_matrix = build_forensic_matrix(
+            assets,
+            matrix_excerpt,
+            min(args.forensic_excerpt_seconds, assets.duration) if matrix_excerpt != assets.audio_path else assets.duration,
+            ffprobe_data,
+            provenance,
+            transcripts,
+            source_stems,
+            summary["scorecard"],
+            songrec_top,
+            acoustid_top,
+            musicbrainz_top,
+            outdir,
+        )
+        if forensic_matrix:
+            forensic_matrix["analysis_excerpt_start_seconds"] = matrix_excerpt_start
+            summary.update(
+                {
+                    "identity_score": forensic_matrix["identity_score"],
+                    "synthetic_score": forensic_matrix["synthetic_score"],
+                    "confidence_score": forensic_matrix["confidence_score"],
+                    "known_family_score": forensic_matrix["known_family_score"],
+                    "family_label": forensic_matrix["family_label"],
+                    "quality_class": forensic_matrix["quality_class"],
+                    "top_evidence_for": forensic_matrix["top_evidence_for"],
+                    "top_evidence_against": forensic_matrix["top_evidence_against"],
+                    "lane_scores": forensic_matrix["lane_scores"],
+                    "lane_confidences": forensic_matrix["lane_confidences"],
+                    "perturbation_stability": forensic_matrix["perturbation_stability"],
+                    "notes": forensic_matrix["notes"],
+                }
+            )
+    summary["forensic_matrix"] = forensic_matrix
+    summary["identity_assessment"] = classify_source(summary["scorecard"], songrec_top, acoustid_top, musicbrainz_top)
+    summary["synthetic_assessment"] = classify_synthetic(forensic_matrix)
+    summary["assessment"] = summary["identity_assessment"]
 
     report_json = outdir / "reports" / "summary.json"
     report_json.write_text(json.dumps(summary, ensure_ascii=True, indent=2), encoding="utf-8")
@@ -1431,8 +2110,10 @@ def identify(args: argparse.Namespace) -> int:
         f"Source Type: {assets.source_type}",
         f"Title: {assets.title}",
         f"Duration: {assets.duration}s",
-        f"Assessment: {summary['assessment']['label']} ({summary['assessment']['confidence']})",
-        f"Reason: {summary['assessment']['reason']}",
+        f"Identity: {summary['identity_assessment']['label']} ({summary['identity_assessment']['confidence']})",
+        f"Identity Reason: {summary['identity_assessment']['reason']}",
+        f"Synthetic Likelihood: {summary['synthetic_assessment']['label']} ({summary['synthetic_assessment']['confidence']})",
+        f"Synthetic Reason: {summary['synthetic_assessment']['reason']}",
     ]
     if assets.metadata.get("spotify_track_id"):
         lines.append(f"Spotify Track ID: {assets.metadata.get('spotify_track_id')}")
@@ -1444,8 +2125,29 @@ def identify(args: argparse.Namespace) -> int:
             "Matched YouTube Candidate: "
             f"{candidate.get('title')} [{candidate.get('id')}] by {candidate.get('channel') or candidate.get('uploader')}"
         )
-    if summary["assessment"].get("best_match"):
-        lines.append(f"Best Match: {summary['assessment']['best_match']}")
+    if summary["identity_assessment"].get("best_match"):
+        lines.append(f"Best Match: {summary['identity_assessment']['best_match']}")
+    if forensic_matrix:
+        lines.extend(
+            [
+                f"Identity Score: {forensic_matrix['identity_score']}",
+                f"Synthetic Score: {forensic_matrix['synthetic_score']}",
+                f"Confidence Score: {forensic_matrix['confidence_score']}",
+                f"Known Family Score: {forensic_matrix['known_family_score']}",
+                f"Family Label: {forensic_matrix['family_label']}",
+                f"Quality Class: {forensic_matrix['quality_class']}",
+                f"Perturbation Stability: {forensic_matrix['perturbation_stability']}",
+                "Top Evidence For:",
+            ]
+        )
+        for item in forensic_matrix.get("top_evidence_for") or []:
+            lines.append(f"- {item}")
+        lines.append("Top Evidence Against:")
+        for item in forensic_matrix.get("top_evidence_against") or []:
+            lines.append(f"- {item}")
+        lines.append("Lane Scores:")
+        for key, value in forensic_matrix.get("lane_scores", {}).items():
+            lines.append(f"- {key}: {value}")
     lines.extend(
         [
             "",
@@ -1506,7 +2208,7 @@ def identify(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="ytdlpchop")
+    parser = argparse.ArgumentParser(prog="ytdlpchopid")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     identify_parser = subparsers.add_parser("identify", help="Run multi-strategy identification on a URL or local file")
@@ -1542,6 +2244,8 @@ def build_parser() -> argparse.ArgumentParser:
     identify_parser.add_argument("--audfprint-root", default="external/audfprint")
     identify_parser.add_argument("--full-source-fingerprint", action="store_true")
     identify_parser.add_argument("--focus-comments", action="store_true")
+    identify_parser.add_argument("--forensic-matrix", action="store_true")
+    identify_parser.add_argument("--forensic-excerpt-seconds", type=int, default=60)
     identify_parser.add_argument("--corpus-dir")
     identify_parser.add_argument("--corpus-top", type=int, default=5)
     identify_parser.add_argument("--corpus-add-source")
