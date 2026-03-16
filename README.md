@@ -5,7 +5,7 @@
 It does two separate jobs on purpose:
 
 - identify the track, if it can
-- score how much synthetic / AI-mediated evidence is present, if identity is weak or absent
+- score how much synthetic-style / AI-mediated evidence is present, if identity is weak or absent
 
 Those are not the same question, and this repo no longer treats them as one question.
 
@@ -49,9 +49,9 @@ This is the shape to keep in mind:
 - `identity_score`:
   how much evidence says this is a known recording or known reused source
 - `synthetic_score`:
-  how much evidence says this is AI-generated or heavily AI-mediated
+  how much synthetic-style evidence is present in the analyzed audio
 - `confidence_score`:
-  how much trust to place in the synthetic score after perturbation checks and source-quality penalties
+  how much trust to place in that synthetic-style read after perturbation checks and source-quality penalties
 - `known_family_score`:
   how much evidence points to a known synthetic family or architecture pattern
 
@@ -80,31 +80,31 @@ Current identity labels:
 - `recognized_cataloged_track`
 - `candidate_match_found`
 - `likely_uncataloged_or_original`
-- `likely_ai_or_channel_original`
+- `possibly_ai_or_channel_original`
 - `needs_manual_review`
 
 ### 2. Synthetic Likelihood
 
 Synthetic likelihood answers:
 
-- how much forensic evidence points toward AI or synthetic mediation?
+- how much forensic evidence points toward synthetic-style or AI-mediated characteristics?
 - does that evidence survive mild perturbation?
 - is it concentrated in one brittle lane or supported by multiple independent lanes?
 
 Current synthetic labels:
 
-- `low`
-- `inconclusive`
-- `probable`
-- `strong`
+- `low_signal`
+- `mixed_or_inconclusive`
+- `moderate_suspicion`
+- `strong_suspicion`
 - `insufficient_evidence`
 
 This split matters. A file can easily be:
 
-- high identity, low synthetic
-- low identity, inconclusive synthetic
-- low identity, probable synthetic
-- high identity and still synthetic-relevant if it exactly matches a known AI corpus item
+- high identity, low synthetic signal
+- low identity, mixed or inconclusive synthetic signal
+- low identity, moderate synthetic suspicion
+- high identity and still synthetic-relevant if it exactly matches a known AI reference item
 
 ## How Identity Works
 
@@ -116,7 +116,6 @@ Primary identity inputs:
 - `AcoustID` + `Chromaprint`
 - `Panako`
 - `audfprint`
-- local corpus reranking
 - transcript-derived `MusicBrainz` candidates
 - source metadata and platform metadata
 
@@ -124,17 +123,19 @@ Interpretation:
 
 - repeated `SongRec` agreement across windows is the strongest current free identity signal in this repo
 - `AcoustID` is useful for near-identical public matches, not broad “sounds similar” matching
-- `Panako` and `audfprint` help more as local reuse / local-corpus tools than public internet recognizers
+- `Panako` and `audfprint` help more as local reuse tools than public internet recognizers
 
 Identity should be read as:
 
-- exact or strong match
+- exact or well-supported match
 - weak candidate
 - unresolved
 
 ## How Synthetic Scoring Works
 
 Synthetic scoring is now a lane-based matrix, not one raw detector.
+
+It should be read as a suspicion model, not a proof engine.
 
 The app builds a `forensic_matrix` and then derives:
 
@@ -174,7 +175,7 @@ What this lane means:
 
 ## Lane 2: Spectral Artifacts
 
-This is the strongest current waveform-only synthetic lane in the repo.
+This is the strongest current waveform-only synthetic-style lane in the repo.
 
 What it looks at:
 
@@ -209,7 +210,7 @@ It looks at features such as:
 - pitch salience proxy
 - duration-based suspicion
 
-This lane exists because some generator families cluster differently on broad audio descriptors, but it is intentionally low-weighted and should not convict anything on its own.
+This lane exists because some generator families cluster differently on broad audio descriptors, but it is intentionally low-weighted and should not be treated as proof on its own.
 
 ## Lane 4: Structure
 
@@ -293,7 +294,7 @@ Current quality classes include things like:
 
 Current confidence logic is intentionally conservative:
 
-- one strong lane is not enough for a high-confidence synthetic call
+- one strong lane is not enough for a high-confidence synthetic suspicion call
 - artifact-only suspicion gets capped
 - strong identity evidence suppresses synthetic overclaiming
 
@@ -448,14 +449,14 @@ If you are debugging why the app made a call, the most useful blocks are:
 
 - identifying mainstream catalog tracks
 - proving when a Spotify page and public audio source agree
-- separating strong identity cases from unresolved cases
+- separating well-supported identity cases from unresolved cases
 - surfacing synthetic-style artifact evidence without automatically overclaiming
 - preserving evidence for later threshold tuning
 
 ## What It Is Still Weak At
 
 - long atmospheric mixes with no public registration
-- strong synthetic claims when only one lane fires
+- hard synthetic claims when only one lane fires
 - family attribution for unknown generators
 - fully reliable lyrics/speech scoring from noisy or short ASR excerpts
 - deep MIR features that are only vendored today and not fully wired yet

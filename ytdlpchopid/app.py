@@ -1092,19 +1092,19 @@ def build_forensic_matrix(
         adjusted_score = min(adjusted_score, 75.0)
     confidence_score = min(confidence_cap, int(round(confidence_lane["multiplier"] * 100)))
     synthetic_label = (
-        "high_confidence_synthetic"
+        "strong_synthetic_suspicion"
         if adjusted_score >= 80.0
-        else "strong_synthetic_evidence"
+        else "elevated_synthetic_suspicion"
         if adjusted_score >= 65.0
-        else "probable_synthetic_or_ai_mediated"
+        else "moderate_synthetic_suspicion"
         if adjusted_score >= 45.0
-        else "weak_suspicion_or_inconclusive"
+        else "weak_synthetic_signal"
         if adjusted_score >= 25.0
-        else "no_meaningful_synthetic_evidence"
+        else "low_synthetic_signal"
     )
     if scorecard["songrec_hit_count"] >= 2 and identity_lane["score"] >= 25.0:
         adjusted_score = min(adjusted_score, 22.0)
-        synthetic_label = "low_synthetic_likelihood_due_to_strong_identity_match"
+        synthetic_label = "low_synthetic_signal_due_to_strong_identity_match"
 
     top_evidence_for = []
     if provenance_lane["label"] != "neutral":
@@ -1759,9 +1759,9 @@ def classify_source(
         )
     ):
         return {
-            "label": "likely_ai_or_channel_original",
+            "label": "possibly_ai_or_channel_original",
             "confidence": "high" if scorecard["high_ai_artifact_clip_count"] >= 2 or scorecard["provenance_signal_count"] > 0 else "medium",
-            "reason": "No recognizer hits, no embedded track metadata, comments request a tracklist, comments mention AI, and heuristic AI/provenance signals are present.",
+            "reason": "No recognizer hits, no embedded track metadata, comments request a tracklist, comments mention AI, and heuristic synthetic-style signals are present. This is suggestive, not proof.",
             "best_match": None,
         }
 
@@ -1798,16 +1798,16 @@ def classify_synthetic(forensic_matrix: dict[str, Any] | None) -> dict[str, Any]
     synthetic_score = forensic_matrix["synthetic_score"]
     confidence_score = forensic_matrix["confidence_score"]
     label = (
-        "strong"
+        "strong_suspicion"
         if synthetic_score >= 60
-        else "probable"
+        else "moderate_suspicion"
         if synthetic_score >= 40
-        else "inconclusive"
+        else "mixed_or_inconclusive"
         if synthetic_score >= 20
-        else "low"
+        else "low_signal"
     )
     confidence = "high" if confidence_score >= 70 else "medium" if confidence_score >= 35 else "low"
-    reason = "; ".join(forensic_matrix.get("top_evidence_for")[:3]) or "No synthetic lane accumulated strong evidence."
+    reason = "; ".join(forensic_matrix.get("top_evidence_for")[:3]) or "No synthetic lane accumulated meaningful evidence."
     return {
         "label": label,
         "confidence": confidence,
