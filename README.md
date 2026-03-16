@@ -1,176 +1,34 @@
 # ytdlpchopid
 
-`ytdlpchopid` is a music identification app for messy sources:
+`ytdlpchopid` is an audio identification and evidence-scoring engine.
 
-- YouTube uploads with no track list
-- long mixes and “war music” style compilations
-- Spotify track URLs, using public metadata and preview audio
-- local audio/video files
-- sources that may be cataloged, uncataloged, channel-original, or AI-generated
+It does two separate jobs on purpose:
 
-This project is built around one goal: identify tracks from ugly real-world sources as accurately as possible. It uses evidence fusion because one recognizer is not enough:
+- identify the track, if it can
+- score how much synthetic / AI-mediated evidence is present, if identity is weak or absent
 
-- exact or near-exact audio recognition
-- distortion-tolerant local matching
-- transcript and metadata search
-- comment and OCR clues
-- corpus similarity
-- AI-style forensic heuristics
+Those are not the same question, and this repo no longer treats them as one question.
 
-The output is meant to answer three questions:
+## What This Repo Is Actually About
 
-- what is this track, if it can be identified
-- what are the best candidates, if it cannot be identified cleanly
-- how strong is the evidence behind that conclusion
+This project is for ugly real-world sources:
 
-## What The App Actually Does
+- YouTube uploads with no chapters or tracklist
+- long mixes and themed “mystery music” uploads
+- local files with missing or junk metadata
+- Spotify track URLs where public metadata and preview audio are available
+- sources that may be cataloged, uncataloged, channel-original, AI-generated, or some mix of those
 
-The main CLI is [`bin/ytdlpchopid`](/home/keith/Documents/code/ytdlpchopid/bin/ytdlpchopid).
+The important design choice is this:
 
-Given a source, it can:
+- `identity` is handled as a matching problem
+- `synthetic-likelihood` is handled as a forensic evidence problem
 
-- download or normalize the media
-- chop it into overlapping windows
-- fingerprint each window
-- run multiple recognizers
-- pull transcript and metadata clues
-- build a multi-lane forensic matrix
-- summarize all of that into one report
+So the app now emits separate outputs for both.
 
-There is also an older Bash workflow at [`bin/yt_audio_id.sh`](/home/keith/Documents/code/ytdlpchopid/bin/yt_audio_id.sh). It is still useful for raw AcoustID-oriented scanning, but the Python app is the real product now.
+## Core Output Model
 
-## Identification Strategy
-
-`ytdlpchopid` uses layers, not one silver bullet.
-
-### 1. Direct audio recognizers
-
-These are the strongest signals when they hit.
-
-- `SongRec`:
-  Shazam-style recognition. In practice this is often the best free recognizer here for mainstream catalog music.
-- `AcoustID` + `Chromaprint`:
-  Best for near-identical audio, duplicate-ish sources, and known fingerprints already present in the public AcoustID/MusicBrainz ecosystem.
-
-If repeated windows agree, the app treats that as strong evidence.
-
-### 2. Distortion-tolerant and local matching
-
-These help when the source is altered, noisy, or not in public databases.
-
-- `Panako`:
-  local distortion-tolerant matcher with per-run local storage
-- `audfprint`:
-  local matching against a local database
-- local corpus reranking:
-  compare against fingerprints you have saved from known tracks, known misses, or channel-local material
-
-These do not magically identify a song against the internet. They help you recognize reuse, repeats, and local families of audio.
-
-### 3. Transcript and metadata search
-
-These are weaker than direct audio hits, but still useful.
-
-- `Whisper`:
-  transcribe vocals or source excerpts
-- `MusicBrainz` search:
-  search recordings from transcript phrases
-- Spotify metadata bridge:
-  use the public Spotify page and preview audio
-- YouTube metadata:
-  titles, descriptions, chapters, comment signals
-- OCR:
-  scrape on-screen text from video frames
-
-This layer is for candidate generation and corroboration, not blind trust.
-
-### 4. AI/original-content classification
-
-When no catalog match exists, the app does not stop. It tries to classify what kind of source it is dealing with.
-
-It currently scores:
-
-- audio artifact heuristics from the analyzed clips
-- provenance-like keywords in metadata or text
-- comment patterns like “what is the song at 8:40?” or “playlist please”
-- lack of embedded track metadata
-- presence or absence of recognizer hits
-
-This does not prove AI generation. It is a classification layer that helps separate:
-
-- recognized catalog tracks
-- likely uncataloged/original material
-- likely AI/channel-original material
-- mixed cases that still need manual review
-
-## Source Types
-
-### YouTube
-
-The app can use:
-
-- media download
-- video metadata
-- comments
-- OCR
-- audio recognition
-
-This is the richest source type for identification work.
-
-### Spotify
-
-`yt-dlp` does not download Spotify audio. Spotify is handled differently:
-
-- parse the public track page
-- extract public metadata
-- use the public preview URL when present
-- optionally search YouTube for a corresponding public upload
-
-That means Spotify support is excellent for metadata and decent for preview-based recognition, but it is limited by what Spotify exposes publicly.
-
-### Local files
-
-If `ffmpeg` can read it, the app can analyze it.
-
-This is the cleanest path when you already have the media locally.
-
-## Outputs
-
-The app now emits two separate decisions for every file:
-
-- `identity_assessment`
-- `synthetic_assessment`
-
-This split is intentional. A file can have:
-
-- strong identity evidence and low synthetic evidence
-- weak identity evidence and inconclusive synthetic evidence
-- no identity evidence and moderate synthetic evidence
-- strong identity evidence and strong synthetic evidence if it matches a known AI corpus item or synthetic family
-
-Identity labels:
-
-- `recognized_cataloged_track`
-- `candidate_match_found`
-- `likely_uncataloged_or_original`
-- `likely_ai_or_channel_original`
-- `needs_manual_review`
-
-Synthetic labels:
-
-- `low`
-- `inconclusive`
-- `probable`
-- `strong`
-- `insufficient_evidence`
-
-The app is intentionally conservative in both directions. Transcript-only candidates are not treated as real IDs, and one noisy synthetic lane is not treated as proof.
-
-## Forensic Matrix
-
-When `--forensic-matrix` is enabled, or when `--ai-heuristics` is enabled, the report also includes a `forensic_matrix` block with separate lane scores.
-
-Stored file-level fields include:
+Every analyzed file can produce:
 
 - `identity_score`
 - `synthetic_score`
@@ -183,7 +41,109 @@ Stored file-level fields include:
 - `lane_scores`
 - `lane_confidences`
 - `perturbation_stability`
-- `notes`
+- `identity_assessment`
+- `synthetic_assessment`
+
+This is the shape to keep in mind:
+
+- `identity_score`:
+  how much evidence says this is a known recording or known reused source
+- `synthetic_score`:
+  how much evidence says this is AI-generated or heavily AI-mediated
+- `confidence_score`:
+  how much trust to place in the synthetic score after perturbation checks and source-quality penalties
+- `known_family_score`:
+  how much evidence points to a known synthetic family or architecture pattern
+
+The machine-readable source of truth is:
+
+- [`reports/summary.json`](/home/keith/Documents/code/ytdlpchopid/reports/summary.json)
+
+The human-readable explanation is:
+
+- [`reports/summary.md`](/home/keith/Documents/code/ytdlpchopid/reports/summary.md)
+
+## Two Independent Decisions
+
+The app now makes two top-level decisions.
+
+### 1. Identity
+
+Identity answers:
+
+- what track is this?
+- how strong is the recording match?
+- are there only weak candidates or no credible match at all?
+
+Current identity labels:
+
+- `recognized_cataloged_track`
+- `candidate_match_found`
+- `likely_uncataloged_or_original`
+- `likely_ai_or_channel_original`
+- `needs_manual_review`
+
+### 2. Synthetic Likelihood
+
+Synthetic likelihood answers:
+
+- how much forensic evidence points toward AI or synthetic mediation?
+- does that evidence survive mild perturbation?
+- is it concentrated in one brittle lane or supported by multiple independent lanes?
+
+Current synthetic labels:
+
+- `low`
+- `inconclusive`
+- `probable`
+- `strong`
+- `insufficient_evidence`
+
+This split matters. A file can easily be:
+
+- high identity, low synthetic
+- low identity, inconclusive synthetic
+- low identity, probable synthetic
+- high identity and still synthetic-relevant if it exactly matches a known AI corpus item
+
+## How Identity Works
+
+Identity is built from matching and candidate evidence, not from AI heuristics.
+
+Primary identity inputs:
+
+- `SongRec`
+- `AcoustID` + `Chromaprint`
+- `Panako`
+- `audfprint`
+- local corpus reranking
+- transcript-derived `MusicBrainz` candidates
+- source metadata and platform metadata
+
+Interpretation:
+
+- repeated `SongRec` agreement across windows is the strongest current free identity signal in this repo
+- `AcoustID` is useful for near-identical public matches, not broad “sounds similar” matching
+- `Panako` and `audfprint` help more as local reuse / local-corpus tools than public internet recognizers
+
+Identity should be read as:
+
+- exact or strong match
+- weak candidate
+- unresolved
+
+## How Synthetic Scoring Works
+
+Synthetic scoring is now a lane-based matrix, not one raw detector.
+
+The app builds a `forensic_matrix` and then derives:
+
+- `synthetic_score`
+- `confidence_score`
+- `known_family_score`
+- `family_label`
+
+### Lane Overview
 
 The current matrix uses these lanes:
 
@@ -193,126 +153,182 @@ The current matrix uses these lanes:
 - structure
 - lyrics and speech
 - generator family
-- confidence and perturbation stability
+- confidence / perturbation stability
 
-It also keeps identity separate through direct recognizers, local matching, and candidate aggregation.
+Each lane contributes evidence differently.
 
-## Scorecard
+## Lane 1: Provenance
 
-Every run writes a machine-readable `scorecard` in `reports/summary.json`.
+This is the strongest positive lane when present and mostly neutral when absent.
 
-Important fields include:
+Current behavior:
 
-- `source_type`
-- `analysis_audio_source`
-- `embedded_metadata_present`
-- `songrec_hit_count`
-- `songrec_distinct_match_count`
-- `acoustid_recording_hit_count`
-- `raw_acoustid_hit_count`
-- `panako_hit_count`
-- `corpus_match_count`
-- `transcript_hit_count`
-- `musicbrainz_candidate_count`
-- `playlist_request_count`
-- `ai_comment_mentions`
-- `timestamp_comment_count`
-- `mean_ai_artifact_score`
-- `max_ai_artifact_score`
+- scans metadata and container-level text for provenance-like signals
+- attempts explicit C2PA detection when tooling is available
+- stores any C2PA-related findings under the provenance lane
 
-Spotify runs also include:
+What this lane means:
 
-- `spotify_track_id_present`
-- `spotify_preview_url_present`
-- `matched_youtube_candidate_present`
-- `youtube_candidate_count`
+- valid provenance can strongly support a synthetic or toolchain-aware conclusion
+- missing provenance does not prove anything
 
-Use the scorecard when you want to understand why the app identified something, refused to overclaim, or surfaced only a weak candidate.
+## Lane 2: Spectral Artifacts
 
-Use the forensic matrix when you want the AI/original-content side explained lane by lane.
+This is the strongest current waveform-only synthetic lane in the repo.
 
-## What Works Well
+What it looks at:
 
-- mainstream catalog tracks
-- official uploads and topic-channel uploads
-- public Spotify tracks with exposed preview audio
-- repeated audio across a local corpus
-- sources where comments or OCR provide useful clues
+- averaged high-band spectral peaks
+- peak count
+- peak prominence
+- spacing regularity
+- persistence across the analyzed excerpt
+- band prominence buckets
+- weak family hints from artifact shape
 
-## What Fails Often
+The app currently stores things like:
 
-- long ambient mixes with no known public registration
-- AI-generated or channel-original music with no public fingerprint coverage
-- heavily transformed uploads
-- obscure music with no MusicBrainz/AcoustID presence
+- `peak_count`
+- `peak_density`
+- `mean_peak_prominence`
+- `peak_persistence`
+- `spacing_regularity`
+- `dominant_spacing_hz`
+- `band_prominence`
 
-This is normal. It reflects the public ecosystem, not just the app.
+This lane is useful, but it is not treated as universal truth. If it fires alone, confidence is capped.
 
-## Tooling
+## Lane 3: Descriptor Priors
 
-Core required:
+This is a weak lane by design.
 
-- `python3`
-- `bash`
-- `yt-dlp`
-- `ffmpeg`
-- `ffprobe`
-- `fpcalc`
+It looks at features such as:
 
-Useful optionals:
+- spectral centroid
+- spectral flux
+- pitch salience proxy
+- duration-based suspicion
 
-- `songrec`
-- `curl`
-- `jq`
-- `gzip`
-- `whisper`
-- `tesseract`
-- Java for `Panako`
+This lane exists because some generator families cluster differently on broad audio descriptors, but it is intentionally low-weighted and should not convict anything on its own.
 
-Extra integrated source trees under [`external/`](/home/keith/Documents/code/ytdlpchopid/external):
+## Lane 4: Structure
 
-- [`external/Panako`](/home/keith/Documents/code/ytdlpchopid/external/Panako)
-- [`external/audfprint`](/home/keith/Documents/code/ytdlpchopid/external/audfprint)
-- [`external/demucs`](/home/keith/Documents/code/ytdlpchopid/external/demucs)
-- [`external/essentia`](/home/keith/Documents/code/ytdlpchopid/external/essentia)
+This is the “music behavior” lane rather than the “spectrogram artifact” lane.
 
-Not every vendored tool is equally wired into the app yet:
+It looks at:
 
-- `Panako` is integrated and exercised
-- `audfprint` is integrated in a basic local-run form
-- `Demucs` is used for stem separation
-- `Essentia` is vendored for future deeper MIR work and local experiments
+- novelty behavior
+- repetition density
+- section regularity
+- transition sharpness
+- tail realism
+- microtiming rigidity
 
-## Secrets
+This is meant to catch cases where the file is not artifact-loud but still behaves in an overly templated or mechanically structured way.
 
-Local secrets go in [`.env`](/home/keith/Documents/code/ytdlpchopid/.env), which is gitignored.
+## Lane 5: Lyrics and Speech
 
-A safe template lives in [`.env.example`](/home/keith/Documents/code/ytdlpchopid/.env.example).
+This is the main robustness add-on to artifact analysis.
 
-Current env vars of interest:
+It uses transcript-derived evidence such as:
 
-- `ACOUSTID_API_KEY`
-- `ACOUSTID_USER_KEY`
+- token count
+- lexical repetition
+- line repetition
+- repeated n-gram ratio
+- bracket-token ratio
+- source / vocals overlap
+- speech feature proxy when stems are available
 
-## Typical Runs
+This lane matters because some synthetic signals survive better in lyric and speech behavior than in codec- or frequency-dependent artifact cues.
 
-Minimal YouTube identification:
+## Lane 6: Generator Family
 
-```bash
-bin/ytdlpchopid identify \
-  --songrec \
-  --acoustid \
-  -o out/basic \
-  'https://www.youtube.com/watch?v=...'
-```
+This lane is for family hints, not forced attribution.
 
-Real YouTube identification run:
+Current outputs:
+
+- `known`
+- `unknown`
+- `none`
+
+And a separate `known_family_score`.
+
+This lane is allowed to say:
+
+- there is no family evidence
+- this looks like an unknown synthetic family
+- this resembles a known architecture-style artifact family
+
+It is not allowed to bluff a precise family label when the evidence is weak.
+
+## Confidence And Perturbation Stability
+
+This is one of the most important parts of the system.
+
+The repo now runs mild perturbation probes against the analyzed excerpt, such as:
+
+- low-pass filtering
+- resampling
+- mild pitch shift
+
+The point is not to “fix” the file. The point is to ask:
+
+- does the synthetic evidence survive mild changes?
+- or is it fragile and likely dependent on one brittle cue?
+
+That shows up as:
+
+- `perturbation_stability`
+- `confidence_score`
+- `quality_class`
+- `notes`
+
+Current quality classes include things like:
+
+- `clean_full_track`
+- `clean_excerpt`
+- `masked`
+- `heavily_transcoded`
+
+Current confidence logic is intentionally conservative:
+
+- one strong lane is not enough for a high-confidence synthetic call
+- artifact-only suspicion gets capped
+- strong identity evidence suppresses synthetic overclaiming
+
+## Why This Matters
+
+A normal music recognizer README would stop at “we matched the song.”
+
+This repo should not stop there, because many of the interesting cases are exactly the ones where:
+
+- no public database match exists
+- the upload may be channel-original
+- the upload may be AI-generated
+- the upload may be a transformed derivative
+- the evidence is mixed and quality-limited
+
+That is why the repo needs to explain not just the ID result, but the evidence structure.
+
+## What The CLI Does
+
+The main CLI is:
+
+- [`bin/ytdlpchopid`](/home/keith/Documents/code/ytdlpchopid/bin/ytdlpchopid)
+
+The old Bash workflow is still present:
+
+- [`bin/yt_audio_id.sh`](/home/keith/Documents/code/ytdlpchopid/bin/yt_audio_id.sh)
+
+But the Python CLI is the real app now.
+
+Typical full run:
 
 ```bash
 source .env
 bin/ytdlpchopid identify \
   --comments \
-  --max-comments 40 \
   --focus-comments \
   --songrec \
   --acoustid \
@@ -358,50 +374,46 @@ bin/ytdlpchopid identify \
   --forensic-matrix \
   --whisper \
   --musicbrainz \
-  --panako \
   --spotify-youtube-search 5 \
   -o out/spotify \
-  'https://open.spotify.com/track/1UEIQUuPESrpdCDHhKLL96'
+  'https://open.spotify.com/track/...'
 ```
 
-Local file run:
+## Source Types
 
-```bash
-bin/ytdlpchopid identify \
-  --songrec \
-  --panako \
-  --max-clips-per-profile 1 \
-  -o out/local \
-  '/path/to/file.webm'
-```
+### YouTube
 
-Original AcoustID-heavy Bash workflow:
+The richest source type in the repo.
 
-```bash
-source .env
-bin/yt_audio_id.sh \
-  --profiles 30:60,30:20,20:10 \
-  -o out/dense \
-  'https://www.youtube.com/watch?v=...'
-```
+Possible evidence:
 
-## Output Layout
+- downloaded media
+- metadata
+- comments
+- OCR
+- clip-based audio recognition
+- transcript clues
+- forensic matrix scoring
 
-App runs write:
+### Spotify
 
-- `reports/summary.json`
-- `reports/summary.md`
+Spotify is treated as metadata-first.
 
-And usually also:
+The app can use:
 
-- `download/`
-- `clips/`
-- `fingerprints/`
-- `acoustid/`
-- `comments/`
-- transcript and excerpt artifacts under `reports/`
+- public page metadata
+- public preview audio when available
+- optional YouTube candidate search
 
-The machine-readable report is the source of truth. The Markdown summary is the readable explanation of how the app got to its answer.
+This makes Spotify useful for canonical track identity even though it is not a normal downloadable audio source for `yt-dlp`.
+
+### Local Files
+
+If `ffmpeg` can decode it, the app can score it.
+
+This is the cleanest path for forensic work because it avoids site extraction issues.
+
+## Report Anatomy
 
 Important machine-readable sections:
 
@@ -413,38 +425,93 @@ Important machine-readable sections:
 - `transcripts`
 - `ocr`
 
-## Real-World Interpretation
+The top report fields worth reading first are:
 
-This app already demonstrated three different behaviors:
+- `identity_score`
+- `synthetic_score`
+- `confidence_score`
+- `known_family_score`
+- `family_label`
+- `top_evidence_for`
+- `top_evidence_against`
 
-- a known YouTube music video was identified cleanly as a catalog track
-- a Spotify track was identified from public metadata, preview audio, and matched YouTube source
-- a “Viking battle songs” style YouTube upload resisted both SongRec and AcoustID, which pushed the app toward `likely_ai_or_channel_original`
+If you are debugging why the app made a call, the most useful blocks are:
 
-That is the right mental model for this project:
+- `lane_scores`
+- `lane_confidences`
+- `forensic_matrix.confidence_lane`
+- `forensic_matrix.spectral_artifact_lane`
+- `forensic_matrix.lyrics_speech_lane`
+- `forensic_matrix.structural_lane`
 
-- sometimes you get a precise song ID
-- sometimes you only get a candidate
-- sometimes the most honest answer is “this looks like uncataloged or AI/channel-original material”
+## What The Current System Is Good At
 
-## Limitations
+- identifying mainstream catalog tracks
+- proving when a Spotify page and public audio source agree
+- separating strong identity cases from unresolved cases
+- surfacing synthetic-style artifact evidence without automatically overclaiming
+- preserving evidence for later threshold tuning
 
-- `AcoustID` is not a general “recognize anything that sounds similar” engine.
-- `SongRec` is strong but still not universal.
-- Spotify support depends on public metadata and public preview availability.
-- Synthetic scoring is heuristic, multi-lane, and confidence-weighted. It is evidence, not proof.
-- Public databases are incomplete. Some misses are real misses, not bugs.
+## What It Is Still Weak At
 
-## Roadmap Direction
+- long atmospheric mixes with no public registration
+- strong synthetic claims when only one lane fires
+- family attribution for unknown generators
+- fully reliable lyrics/speech scoring from noisy or short ASR excerpts
+- deep MIR features that are only vendored today and not fully wired yet
 
-The repo already has the shape needed for deeper MIR and evidence-driven identification work:
+## What Is Already Vendored Or Integrated
 
-- stronger local corpus workflows
-- better `audfprint` indexing and querying
-- deeper `Essentia` features such as melody, cover similarity, and embeddings
-- improved OCR and frame targeting
-- better explanation and ranking of candidate evidence
+Core tools:
 
-If you care about one sentence summary:
+- `python3`
+- `bash`
+- `yt-dlp`
+- `ffmpeg`
+- `ffprobe`
+- `fpcalc`
 
-`ytdlpchopid` is a free-first audio identification engine that tries to name the track, rank the candidates, and show the evidence behind its conclusions.
+Optional but important:
+
+- `songrec`
+- `curl`
+- `jq`
+- `gzip`
+- `whisper`
+- `tesseract`
+- Java for `Panako`
+
+Integrated source trees:
+
+- [`external/Panako`](/home/keith/Documents/code/ytdlpchopid/external/Panako)
+- [`external/audfprint`](/home/keith/Documents/code/ytdlpchopid/external/audfprint)
+- [`external/demucs`](/home/keith/Documents/code/ytdlpchopid/external/demucs)
+- [`external/essentia`](/home/keith/Documents/code/ytdlpchopid/external/essentia)
+
+Current status:
+
+- `Panako` is integrated
+- `audfprint` is wired in a basic local form
+- `Demucs` is used for stem separation
+- `Essentia` is vendored for future deeper MIR and forensic work
+
+## Secrets
+
+Local secrets live in:
+
+- [`.env`](/home/keith/Documents/code/ytdlpchopid/.env)
+
+Template:
+
+- [`.env.example`](/home/keith/Documents/code/ytdlpchopid/.env.example)
+
+Current env vars of interest:
+
+- `ACOUSTID_API_KEY`
+- `ACOUSTID_USER_KEY`
+
+## Bottom Line
+
+This repo is no longer just “a tool that tries to name songs.”
+
+It is an identification system with a second, explicit evidence model for synthetic-likelihood. The README should make that obvious, because that is now the real shape of the app.
